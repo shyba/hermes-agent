@@ -34,7 +34,7 @@ _HERMES_CORE_TOOLS = [
     # Terminal + process management
     "terminal", "process",
     # File manipulation
-    "read_file", "write_file", "patch", "search_files",
+    "read_file", "write_file", "edit_file", "patch", "search_files",
     # Vision + image generation
     "vision_analyze", "image_generate",
     # Skills
@@ -146,8 +146,8 @@ TOOLSETS = {
     },
     
     "file": {
-        "description": "File manipulation tools: read, write, patch (with fuzzy matching), and search (content + files)",
-        "tools": ["read_file", "write_file", "patch", "search_files"],
+        "description": "File manipulation tools: read, write, edit (with fuzzy matching), patch, and search (content + files)",
+        "tools": ["read_file", "write_file", "edit_file", "patch", "search_files"],
         "includes": []
     },
     
@@ -277,7 +277,7 @@ TOOLSETS = {
         "tools": [
             "web_search", "web_extract",
             "terminal", "process",
-            "read_file", "write_file", "patch", "search_files",
+            "read_file", "write_file", "edit_file", "patch", "search_files",
             "vision_analyze",
             "skills_list", "skill_view", "skill_manage",
             "browser_navigate", "browser_snapshot", "browser_click",
@@ -299,7 +299,7 @@ TOOLSETS = {
             # Terminal + process management
             "terminal", "process",
             # File manipulation
-            "read_file", "write_file", "patch", "search_files",
+            "read_file", "write_file", "edit_file", "patch", "search_files",
             # Vision + image generation
             "vision_analyze", "image_generate",
             # Skills

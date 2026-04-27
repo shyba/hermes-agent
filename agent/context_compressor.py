@@ -17,6 +17,7 @@ Improvements over v2:
   - Richer tool call/result detail in summarizer input
 """
 
+import copy
 import hashlib
 import json
 import logging
@@ -55,6 +56,22 @@ _MIN_SUMMARY_TOKENS = 2000
 _SUMMARY_RATIO = 0.20
 # Absolute ceiling for summary tokens (even on very large context windows)
 _SUMMARY_TOKENS_CEILING = 12_000
+_SUMMARY_PROMPT_OVERHEAD_TOKENS = 3_000
+_SUMMARY_REQUEST_SAFETY_RATIO = 0.90
+
+_REFETCHABLE_TOOL_NAMES = frozenset({
+    "browser_snapshot",
+    "browser_navigate",
+    "browser_click",
+    "browser_type",
+    "browser_scroll",
+    "web_search",
+    "search_files",
+    "read_file",
+})
+_ATTACHED_FILE_REF_RE = re.compile(
+    r"📄\s+@file:(?P<path>.+?)\s+\((?P<tokens>\d+)\s+tokens\)"
+)
 
 # Placeholder used when pruning old tool results
 _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
@@ -984,6 +1001,332 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 break
         return f"{SUMMARY_PREFIX}\n{text}" if text else SUMMARY_PREFIX
 
+    @staticmethod
+    def _strip_existing_summary_text(text: str) -> str:
+        """Remove an already-injected compaction summary from message text.
+
+        Re-compression passes the previous summary separately as
+        ``PREVIOUS SUMMARY``. If the old summary message also sits in the
+        middle region, feeding it again as a normal turn causes recursive,
+        duplicate summaries. For merged summary+tail messages, keep only the
+        real tail content after the merge separator.
+        """
+        if not isinstance(text, str):
+            return text
+        if not text.lstrip().startswith(SUMMARY_PREFIX):
+            return text
+        marker = "--- END OF CONTEXT SUMMARY"
+        marker_idx = text.find(marker)
+        if marker_idx < 0:
+            return ""
+        after = text.find("\n\n", marker_idx)
+        if after < 0:
+            return ""
+        return text[after + 2:].lstrip()
+
+    def _drop_existing_summary_turns(
+        self,
+        turns: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Remove prior compaction summaries from turns being summarized."""
+        cleaned: List[Dict[str, Any]] = []
+        for msg in turns:
+            content = msg.get("content")
+            if isinstance(content, str):
+                stripped = self._strip_existing_summary_text(content)
+                if stripped == "":
+                    continue
+                if stripped != content:
+                    msg = {**msg, "content": stripped}
+                cleaned.append(msg)
+                continue
+
+            if isinstance(content, list):
+                changed = False
+                new_content = []
+                for block in content:
+                    if isinstance(block, dict) and isinstance(block.get("text"), str):
+                        stripped = self._strip_existing_summary_text(block["text"])
+                        if stripped == "":
+                            changed = True
+                            continue
+                        if stripped != block["text"]:
+                            block = {**block, "text": stripped}
+                            changed = True
+                    new_content.append(block)
+                if not new_content:
+                    continue
+                if changed:
+                    msg = {**msg, "content": new_content}
+                cleaned.append(msg)
+                continue
+
+            cleaned.append(msg)
+        return cleaned
+
+    def _tombstone_tool_results_for_summary(
+        self,
+        turns: List[Dict[str, Any]],
+        *,
+        refetchable_tools: Optional[set[str]] = None,
+        target_tokens: Optional[int] = None,
+        estimate_fn=None,
+        large_threshold_chars: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Replace selected large/old tool results with compact tombstones.
+
+        The assistant tool-call message and the role=tool protocol entry are
+        preserved. Only the tool content is shortened so the summarizer still
+        sees the call graph and the reason the result was cleared. When
+        ``target_tokens`` is provided, tombstone the best candidates only until
+        the selected estimator fits.
+        """
+        refetchable_tools = refetchable_tools or _REFETCHABLE_TOOL_NAMES
+        estimate_fn = estimate_fn or self._estimate_summary_request_tokens
+
+        tool_meta: dict[str, dict[str, Any]] = {}
+        for msg in turns:
+            if msg.get("role") != "assistant":
+                continue
+            for tc in msg.get("tool_calls") or []:
+                if not isinstance(tc, dict):
+                    continue
+                cid = self._get_tool_call_id(tc)
+                if not cid:
+                    continue
+                fn = tc.get("function", {}) or {}
+                tool_meta[cid] = {
+                    "tool_name": fn.get("name", "?"),
+                    "arguments": fn.get("arguments", ""),
+                }
+
+        def _is_large(content: Any) -> tuple[bool, int]:
+            if content is None:
+                return False, 0
+            if isinstance(content, str):
+                size = len(content)
+            else:
+                size = len(_content_text_for_contains(content))
+            threshold = large_threshold_chars
+            if threshold is None:
+                threshold = max(4000, self.tail_token_budget * _CHARS_PER_TOKEN)
+            return size >= threshold, size
+
+        def _tool_tombstone(msg: Dict[str, Any], *, size: int) -> str:
+            cid = msg.get("tool_call_id", "")
+            meta = tool_meta.get(cid, {})
+            tool_name = meta.get("tool_name", msg.get("tool_name") or msg.get("name") or "?")
+            args = meta.get("arguments", "")
+            return (
+                "[tool result compacted]\n"
+                f"tool: {tool_name}\n"
+                f"tool_call_id: {cid or '?'}\n"
+                f"args: {args}\n"
+                f"original_size: {size:,} chars\n"
+                f"refetchable: {'yes' if tool_name in refetchable_tools else 'no'}\n"
+                "reason: omitted during context compaction because the "
+                "compaction input exceeded the safe request budget.\n"
+                + (
+                    "note: rerun the same tool call if exact content is needed."
+                    if tool_name in refetchable_tools
+                    else "note: output was too large to retain; do not rerun "
+                         "side-effecting tools unless the user asks."
+                )
+            )
+
+        result = [m.copy() for m in turns]
+        candidates: list[tuple[int, bool, bool, int]] = []
+        over_target = target_tokens is not None and estimate_fn(result) > target_tokens
+        for i, msg in enumerate(result):
+            if msg.get("role") != "tool":
+                continue
+            cid = msg.get("tool_call_id", "")
+            meta = tool_meta.get(cid, {})
+            tool_name = meta.get("tool_name", msg.get("tool_name") or msg.get("name") or "?")
+            is_large, size = _is_large(msg.get("content"))
+            is_refetchable = tool_name in refetchable_tools
+            if is_large or is_refetchable or (over_target and size > 500):
+                candidates.append((i, is_large, is_refetchable, size))
+
+        if target_tokens is not None and estimate_fn(result) <= target_tokens:
+            return result
+
+        # Prefer the biggest re-fetchable outputs, then other large outputs,
+        # then smaller re-fetchable outputs. Older equal-priority results go
+        # first because newer work is usually closer to the protected tail.
+        candidates.sort(key=lambda item: (not item[2], not item[1], -item[3], item[0]))
+        for i, _is_large_result, _is_refetchable, size in candidates:
+            msg = result[i]
+            tombstone = _tool_tombstone(msg, size=size)
+            new_msg = msg.copy()
+            new_msg["content"] = tombstone
+            result[i] = new_msg
+            if target_tokens is not None and estimate_fn(result) <= target_tokens:
+                break
+        return result
+
+    def _compact_stale_large_user_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        target_tokens: Optional[int] = None,
+        large_threshold_chars: int = 24_000,
+    ) -> List[Dict[str, Any]]:
+        """Replace older huge user context blocks while preserving the latest ask.
+
+        Failed retries can persist the same @file-expanded user message more
+        than once. The latest user message is the active request and must stay
+        intact; older large user messages should be represented by the summary
+        and a compact tombstone so one attached file cannot survive every
+        compaction pass as protected head context.
+        """
+        if not messages:
+            return messages
+
+        last_user_idx = -1
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "user":
+                last_user_idx = i
+                break
+        if last_user_idx < 0:
+            return messages
+
+        result = [m.copy() for m in messages]
+        def _attached_file_paths(text: str) -> set[str]:
+            paths: set[str] = set()
+            for match in _ATTACHED_FILE_REF_RE.finditer(text):
+                path = match.group("path").strip().strip("`\"'")
+                if path:
+                    paths.add(path)
+            return paths
+
+        seen_hashes: set[str] = set()
+        seen_file_paths: set[str] = set()
+        candidates: list[tuple[int, bool, bool, int]] = []
+        for i in range(len(result) - 1, -1, -1):
+            msg = result[i]
+            if msg.get("role") != "user":
+                continue
+            text = _content_text_for_contains(msg.get("content"))
+            size = len(text)
+            digest = hashlib.md5(text.encode("utf-8", errors="replace")).hexdigest() if size > 1000 else ""
+            duplicate = bool(digest and digest in seen_hashes)
+            if digest:
+                seen_hashes.add(digest)
+            file_paths = _attached_file_paths(text)
+            duplicate_file_path = bool(file_paths and (file_paths & seen_file_paths))
+            seen_file_paths.update(file_paths)
+            if i == last_user_idx:
+                continue
+            if duplicate or duplicate_file_path or size >= large_threshold_chars:
+                candidates.append((i, duplicate, duplicate_file_path, size))
+
+        if target_tokens is not None and estimate_messages_tokens_rough(result) <= target_tokens:
+            # Still remove exact older duplicates even when already under the
+            # target; same-file older injections are also stale context bloat.
+            candidates = [candidate for candidate in candidates if candidate[1] or candidate[2]]
+
+        # Biggest stale contexts first; exact duplicates and same-file older
+        # injections before merely-large unrelated user messages.
+        candidates.sort(key=lambda item: (not (item[1] or item[2]), -item[3], item[0]))
+        for i, duplicate, duplicate_file_path, size in candidates:
+            msg = result[i]
+            text = _content_text_for_contains(msg.get("content"))
+            file_paths = sorted(_attached_file_paths(text))
+            preview = " ".join(text[:500].split())
+            if len(text) > 500:
+                preview += "..."
+            new_msg = msg.copy()
+            new_msg["content"] = (
+                "[large user context compacted]\n"
+                f"original_size: {size:,} chars\n"
+                f"rough_tokens: {(size + 3) // _CHARS_PER_TOKEN:,}\n"
+                f"duplicate_of_later_user_message: {'yes' if duplicate else 'no'}\n"
+                f"older_duplicate_file_path: {'yes' if duplicate_file_path else 'no'}\n"
+                f"attached_files: {', '.join(file_paths) if file_paths else 'unknown'}\n"
+                "reason: older user-supplied context was omitted during "
+                "overflow compaction because the retry request exceeded the "
+                "model context window.\n"
+                "note: use the compaction summary plus the latest user message "
+                "for the active task; do not treat this tombstone as a new request.\n"
+                f"preview: {preview}"
+            )
+            result[i] = new_msg
+            if target_tokens is not None and estimate_messages_tokens_rough(result) <= target_tokens:
+                break
+        return result
+
+    def _truncate_tool_call_arguments_for_overflow(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        head_chars: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """Shrink oversized assistant tool-call arguments in retained context."""
+        result = [m.copy() for m in messages]
+        for i, msg in enumerate(result):
+            if msg.get("role") != "assistant" or not msg.get("tool_calls"):
+                continue
+            new_tcs = []
+            modified = False
+            for tc in msg.get("tool_calls") or []:
+                if isinstance(tc, dict):
+                    fn = tc.get("function", {}) or {}
+                    args = fn.get("arguments", "")
+                    if isinstance(args, str) and len(args) > 500:
+                        new_args = _truncate_tool_call_args_json(args, head_chars=head_chars)
+                        if new_args != args:
+                            tc = {**tc, "function": {**fn, "arguments": new_args}}
+                            modified = True
+                new_tcs.append(tc)
+            if modified:
+                result[i] = {**msg, "tool_calls": new_tcs}
+        return result
+
+    def compact_redundant_context(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        target_tokens: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Deterministically trim retry bloat without calling an LLM.
+
+        This is intentionally narrower than full summarizing compression. It
+        removes content that is either reproducible (tool outputs / tool-call
+        args) or stale duplicate user context (older @file payloads where a
+        newer user message attached the same file path). It is useful before
+        providers such as MiniMax, where every failed recovery request has a
+        fixed request cost.
+        """
+        target = target_tokens or self.threshold_tokens
+        trimmed = self._truncate_tool_call_arguments_for_overflow(messages)
+        trimmed = self._tombstone_tool_results_for_summary(
+            trimmed,
+            target_tokens=target,
+            estimate_fn=estimate_messages_tokens_rough,
+            large_threshold_chars=4000,
+        )
+        trimmed = self._compact_stale_large_user_messages(
+            trimmed,
+            target_tokens=target,
+        )
+        return self._sanitize_tool_pairs(trimmed)
+
+    def _summary_input_token_budget(self) -> int:
+        """Return the safe input budget for the auxiliary summarizer request."""
+        effective_summary_tokens = max(_MIN_SUMMARY_TOKENS, self.max_summary_tokens)
+        output_budget = int(effective_summary_tokens * 1.3)
+        safety_window = int(self.context_length * _SUMMARY_REQUEST_SAFETY_RATIO)
+        return max(
+            _MIN_SUMMARY_TOKENS,
+            safety_window - output_budget - _SUMMARY_PROMPT_OVERHEAD_TOKENS,
+        )
+
+    def _estimate_summary_request_tokens(self, turns: List[Dict[str, Any]]) -> int:
+        """Estimate the summarizer request after per-message serialization caps."""
+        serialized_chars = len(self._serialize_for_summary(turns))
+        return serialized_chars // _CHARS_PER_TOKEN + _SUMMARY_PROMPT_OVERHEAD_TOKENS
+
     # ------------------------------------------------------------------
     # Tool-call / tool-result pair integrity helpers
     # ------------------------------------------------------------------
@@ -996,64 +1339,68 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         return getattr(tc, "id", "") or ""
 
     def _sanitize_tool_pairs(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Fix orphaned tool_call / tool_result pairs after compression.
+        """Fix and adjacency-normalize tool_call / tool_result pairs.
 
-        Two failure modes:
-        1. A tool *result* references a call_id whose assistant tool_call was
-           removed (summarized/truncated).  The API rejects this with
-           "No tool call found for function call output with call_id ...".
-        2. An assistant message has tool_calls whose results were dropped.
-           The API rejects this because every tool_call must be followed by
-           a tool result with the matching call_id.
-
-        This method removes orphaned results and inserts stub results for
-        orphaned calls so the message list is always well-formed.
+        Providers require every assistant tool_call to be followed immediately
+        by matching role=tool messages. Compression can remove or move either
+        side of the pair, so rebuild the ordering from surviving assistant
+        calls and surviving tool results.
         """
-        surviving_call_ids: set = set()
+        surviving_call_ids: list[str] = []
         for msg in messages:
             if msg.get("role") == "assistant":
                 for tc in msg.get("tool_calls") or []:
                     cid = self._get_tool_call_id(tc)
                     if cid:
-                        surviving_call_ids.add(cid)
+                        surviving_call_ids.append(cid)
 
-        result_call_ids: set = set()
+        surviving_id_set = set(surviving_call_ids)
+        tool_result_by_id: dict[str, Dict[str, Any]] = {}
         for msg in messages:
             if msg.get("role") == "tool":
                 cid = msg.get("tool_call_id")
-                if cid:
-                    result_call_ids.add(cid)
+                if cid and cid in surviving_id_set and cid not in tool_result_by_id:
+                    tool_result_by_id[cid] = msg
 
-        # 1. Remove tool results whose call_id has no matching assistant tool_call
-        orphaned_results = result_call_ids - surviving_call_ids
-        if orphaned_results:
-            messages = [
-                m for m in messages
-                if not (m.get("role") == "tool" and m.get("tool_call_id") in orphaned_results)
-            ]
-            if not self.quiet_mode:
-                logger.info("Compression sanitizer: removed %d orphaned tool result(s)", len(orphaned_results))
+        patched: List[Dict[str, Any]] = []
+        inserted_results = 0
+        stubbed_results = 0
+        removed_orphans = 0
+        for msg in messages:
+            if msg.get("role") == "tool":
+                if msg.get("tool_call_id") not in surviving_id_set:
+                    removed_orphans += 1
+                continue
 
-        # 2. Add stub results for assistant tool_calls whose results were dropped
-        missing_results = surviving_call_ids - result_call_ids
-        if missing_results:
-            patched: List[Dict[str, Any]] = []
-            for msg in messages:
-                patched.append(msg)
-                if msg.get("role") == "assistant":
-                    for tc in msg.get("tool_calls") or []:
-                        cid = self._get_tool_call_id(tc)
-                        if cid in missing_results:
-                            patched.append({
-                                "role": "tool",
-                                "content": "[Result from earlier conversation — see context summary above]",
-                                "tool_call_id": cid,
-                            })
-            messages = patched
-            if not self.quiet_mode:
-                logger.info("Compression sanitizer: added %d stub tool result(s)", len(missing_results))
+            patched.append(msg)
+            if msg.get("role") != "assistant":
+                continue
 
-        return messages
+            for tc in msg.get("tool_calls") or []:
+                cid = self._get_tool_call_id(tc)
+                if not cid:
+                    continue
+                existing = tool_result_by_id.get(cid)
+                if existing:
+                    patched.append(existing)
+                    inserted_results += 1
+                else:
+                    patched.append({
+                        "role": "tool",
+                        "content": "[Result from earlier conversation — see context summary above]",
+                        "tool_call_id": cid,
+                    })
+                    stubbed_results += 1
+
+        if not self.quiet_mode and (removed_orphans or stubbed_results or inserted_results):
+            logger.info(
+                "Compression sanitizer: normalized tool pairs "
+                "(inserted=%d stubbed=%d removed_orphans=%d)",
+                inserted_results,
+                stubbed_results,
+                removed_orphans,
+            )
+        return patched
 
     def _align_boundary_forward(self, messages: List[Dict[str, Any]], idx: int) -> int:
         """Push a compress-start boundary forward past any orphan tool results.
@@ -1232,7 +1579,15 @@ The user has requested that this compaction PRIORITISE preserving all informatio
     # Main compression entry point
     # ------------------------------------------------------------------
 
-    def compress(self, messages: List[Dict[str, Any]], current_tokens: int = None, focus_topic: str = None) -> List[Dict[str, Any]]:
+    def compress(
+        self,
+        messages: List[Dict[str, Any]],
+        current_tokens: int = None,
+        focus_topic: str = None,
+        *,
+        overflow_snapshot: Optional[Dict[str, Any]] = None,
+        overflow_mode: bool = False,
+    ) -> List[Dict[str, Any]]:
         """Compress conversation messages by summarizing middle turns.
 
         Algorithm:
@@ -1271,7 +1626,13 @@ The user has requested that this compaction PRIORITISE preserving all informatio
 
         display_tokens = current_tokens if current_tokens else self.last_prompt_tokens or estimate_messages_tokens_rough(messages)
 
-        # Phase 1: Prune old tool results (cheap, no LLM call)
+        # Phase 1: Prune old tool results (cheap, no LLM call).
+        #
+        # Keep the original messages for the LLM summary. The pruned copy is
+        # used for boundary calculation and final transcript assembly, but if
+        # the summarizer sees only "[read_file] read foo.py" style placeholders
+        # it cannot preserve the actual findings from old tool output.
+        summary_source_messages = messages
         messages, pruned_count = self._prune_old_tool_results(
             messages, protect_tail_count=self.protect_last_n,
             protect_tail_tokens=self.tail_token_budget,
@@ -1289,7 +1650,35 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         if compress_start >= compress_end:
             return messages
 
-        turns_to_summarize = messages[compress_start:compress_end]
+        turns_to_summarize = self._drop_existing_summary_turns(
+            summary_source_messages[compress_start:compress_end]
+        )
+        summary_input = turns_to_summarize
+        summary_input_estimate = self._estimate_summary_request_tokens(summary_input)
+        if overflow_mode and overflow_snapshot and isinstance(overflow_snapshot.get("messages"), list):
+            snapshot_messages = copy.deepcopy(overflow_snapshot["messages"])
+            snapshot_middle = self._drop_existing_summary_turns(
+                snapshot_messages[compress_start:min(compress_end, len(snapshot_messages))]
+            )
+            if not snapshot_middle and snapshot_messages:
+                snapshot_middle = self._drop_existing_summary_turns(snapshot_messages)
+            tail_count = min(self.protect_last_n + 3, len(summary_input))
+            snapshot_candidate = snapshot_middle
+            if tail_count:
+                snapshot_candidate = snapshot_candidate + copy.deepcopy(summary_input[-tail_count:])
+            snapshot_estimate = self._estimate_summary_request_tokens(snapshot_candidate)
+            if snapshot_estimate < summary_input_estimate:
+                summary_input = snapshot_candidate
+                summary_input_estimate = snapshot_estimate
+
+        summary_input_budget = self._summary_input_token_budget()
+        if summary_input_estimate > summary_input_budget:
+            summary_input = self._tombstone_tool_results_for_summary(
+                summary_input,
+                target_tokens=summary_input_budget,
+            )
+            if not self.quiet_mode:
+                logger.info("Compression: tombstoned oversized tool results before summarization")
 
         if not self.quiet_mode:
             logger.info(
@@ -1314,7 +1703,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             )
 
         # Phase 3: Generate structured summary
-        summary = self._generate_summary(turns_to_summarize, focus_topic=focus_topic)
+        summary = self._generate_summary(summary_input, focus_topic=focus_topic)
 
         # Phase 4: Assemble compressed message list
         compressed = []
@@ -1385,6 +1774,28 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 )
                 _merge_summary_into_tail = False
             compressed.append(msg)
+
+        if overflow_mode and estimate_messages_tokens_rough(compressed) > self.threshold_tokens:
+            before_overflow_trim = estimate_messages_tokens_rough(compressed)
+            compressed = self._truncate_tool_call_arguments_for_overflow(compressed)
+            compressed = self._tombstone_tool_results_for_summary(
+                compressed,
+                target_tokens=self.threshold_tokens,
+                estimate_fn=estimate_messages_tokens_rough,
+                large_threshold_chars=4000,
+            )
+            compressed = self._compact_stale_large_user_messages(
+                compressed,
+                target_tokens=self.threshold_tokens,
+            )
+            after_overflow_trim = estimate_messages_tokens_rough(compressed)
+            if after_overflow_trim < before_overflow_trim and not self.quiet_mode:
+                logger.info(
+                    "Compression: overflow trim reduced retained transcript "
+                    "from ~%d to ~%d tokens",
+                    before_overflow_trim,
+                    after_overflow_trim,
+                )
 
         self.compression_count += 1
 

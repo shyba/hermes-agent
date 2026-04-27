@@ -1,0 +1,4 @@
+{"s":1,"t":"run","event":"created","run":"harness-fixture-complete","ok":true}
+{"s":2,"t":"intent","latest":"Implement first-slice harness tests.","ok":true}
+{"s":3,"t":"sensor","id":"tests.focused","covers":["ac1","ac2"],"after":2,"ok":true}
+{"s":4,"t":"finalization","status":"complete","ok":true}

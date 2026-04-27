@@ -59,6 +59,8 @@ def _mock_handle_function_call(function_name, function_args, task_id=None, user_
         return json.dumps({"content": "line 1\nline 2\nline 3\n", "total_lines": 3})
     if function_name == "write_file":
         return json.dumps({"status": "ok", "path": function_args.get("path", "")})
+    if function_name == "edit_file":
+        return json.dumps({"status": "ok", "replacements": 1})
     if function_name == "search_files":
         return json.dumps({"matches": [{"file": "test.py", "line": 1, "text": "match"}]})
     if function_name == "patch":
@@ -463,8 +465,9 @@ class TestStubSchemaDrift(unittest.TestCase):
         self.assertIn("offset", src)
         self.assertIn("output_mode", src)
 
-        # patch must accept mode and patch params
-        self.assertIn("mode", src)
+        # File-writing RPC helpers are intentionally not available from execute_code.
+        self.assertNotIn("def write_file(", src)
+        self.assertNotIn("def patch(", src)
 
 
 # ---------------------------------------------------------------------------
@@ -479,6 +482,8 @@ class TestBuildExecuteCodeSchema(unittest.TestCase):
         desc = schema["description"]
         for name, _ in _TOOL_DOC_LINES:
             self.assertIn(name, desc, f"Default schema should mention '{name}'")
+        self.assertNotIn("write_file(", desc)
+        self.assertNotIn("patch(", desc)
 
     def test_schema_structure(self):
         schema = build_execute_code_schema()
@@ -513,12 +518,18 @@ class TestBuildExecuteCodeSchema(unittest.TestCase):
     def test_import_examples_fallback_when_no_preferred(self):
         """When neither web_search nor terminal are enabled, falls back to
         sorted first two tools."""
-        enabled = {"read_file", "write_file", "patch"}
+        enabled = {"read_file", "search_files"}
         schema = build_execute_code_schema(enabled)
         code_desc = schema["parameters"]["properties"]["code"]["description"]
-        # Should use sorted first 2: patch, read_file
-        self.assertIn("patch", code_desc)
         self.assertIn("read_file", code_desc)
+        self.assertIn("search_files", code_desc)
+
+    def test_file_write_tools_are_filtered_from_schema(self):
+        schema = build_execute_code_schema({"read_file", "write_file", "patch"})
+        desc = schema["description"]
+        self.assertIn("read_file(", desc)
+        self.assertNotIn("write_file(", desc)
+        self.assertNotIn("patch(", desc)
 
     def test_empty_set_produces_valid_description(self):
         """build_execute_code_schema(set()) must not produce 'import , ...'
@@ -538,8 +549,8 @@ class TestBuildExecuteCodeSchema(unittest.TestCase):
             sandbox_enabled = SANDBOX_ALLOWED_TOOLS & tools_to_include
             dynamic_schema = build_execute_code_schema(sandbox_enabled)
 
-        SANDBOX_ALLOWED_TOOLS = {web_search, web_extract, read_file, write_file,
-                                  search_files, patch, terminal}
+        SANDBOX_ALLOWED_TOOLS = {web_search, web_extract, read_file,
+                                  search_files, terminal}
         tools_to_include  = {"execute_code"}
         intersection      = empty set
         """
@@ -588,6 +599,12 @@ class TestBuildExecuteCodeSchema(unittest.TestCase):
         schema_none = build_execute_code_schema(None)
         schema_all = build_execute_code_schema(SANDBOX_ALLOWED_TOOLS)
         self.assertEqual(schema_none["description"], schema_all["description"])
+
+    def test_description_discourages_raw_file_edits(self):
+        schema = build_execute_code_schema()
+        desc = schema["description"]
+        self.assertIn("Do not use this for normal file edits", desc)
+        self.assertIn("HERMES_ALLOW_RAW_FILE_WRITES", desc)
 
 
 # ---------------------------------------------------------------------------
@@ -710,6 +727,28 @@ class TestExecuteCodeEdgeCases(unittest.TestCase):
         result = json.loads(execute_code("   \n\t  ", task_id="test"))
         self.assertIn("error", result)
         self.assertIn("No code", result["error"])
+
+    def test_raw_open_write_is_blocked(self):
+        result = json.loads(execute_code("open('demo.txt', 'w').write('x')", task_id="test"))
+        self.assertIn("error", result)
+        self.assertIn("Raw Python file write blocked", result["error"])
+        self.assertIn("edit_file", result["error"])
+
+    def test_path_write_text_is_blocked(self):
+        code = "from pathlib import Path\nPath('demo.txt').write_text('x')"
+        result = json.loads(execute_code(code, task_id="test"))
+        self.assertIn("error", result)
+        self.assertIn("Path.write_text", result["error"])
+
+    def test_raw_write_escape_allows_generated_large_files(self):
+        code = (
+            "# HERMES_ALLOW_RAW_FILE_WRITES\n"
+            "print('intentional generated large file write')\n"
+        )
+        with patch("model_tools.handle_function_call", return_value='{}'):
+            result = json.loads(execute_code(code, task_id="test-escape"))
+        self.assertEqual(result["status"], "success")
+        self.assertIn("intentional generated large file write", result["output"])
 
     @unittest.skipIf(sys.platform == "win32", "UDS not available on Windows")
     def test_none_enabled_tools_uses_all(self):

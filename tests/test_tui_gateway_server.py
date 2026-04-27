@@ -1932,6 +1932,63 @@ def test_prompt_submit_history_version_match_persists_normally(monkeypatch):
         server._sessions.pop("sid", None)
 
 
+def test_prompt_submit_replays_pending_steer(monkeypatch):
+    """TUI parity: a final-result pending_steer starts the next turn."""
+
+    calls = []
+
+    class _Agent:
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None
+        ):
+            calls.append(prompt)
+            if len(calls) == 1:
+                return {
+                    "final_response": "not done",
+                    "pending_steer": "continue now",
+                    "messages": [{"role": "assistant", "content": "not done"}],
+                }
+            return {
+                "final_response": "done",
+                "messages": [{"role": "assistant", "content": "done"}],
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    server._sessions["sid"] = _session(agent=_Agent())
+    emits: list[tuple] = []
+    try:
+        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        monkeypatch.setattr(server, "_get_usage", lambda _a: {})
+        monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
+        monkeypatch.setattr(server, "_emit", lambda *a: emits.append(a))
+
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "start"},
+            }
+        )
+
+        assert resp.get("result")
+        assert calls == ["start", "continue now"]
+        complete_calls = [a for a in emits if a[0] == "message.complete"]
+        assert len(complete_calls) == 2
+        assert complete_calls[0][2]["pending_steer"] == "continue now"
+        assert any(
+            a[0] == "status.update" and a[2]["kind"] == "continuation"
+            for a in emits
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+
 # ---------------------------------------------------------------------------
 # session.interrupt must only cancel pending prompts owned by the calling
 # session — it must not blast-resolve clarify/sudo/secret prompts on

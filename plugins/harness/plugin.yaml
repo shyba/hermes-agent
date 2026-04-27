@@ -1,0 +1,18 @@
+name: harness
+version: 0.1.0
+description: "Opt-in harness command surface for deterministic local run orchestration."
+author: NousResearch
+kind: standalone
+commands:
+  - harness
+provides_tools:
+  - harness_check
+  - harness_report_dead_end
+  - harness_resolve_blockers
+provides_hooks:
+  - pre_llm_call
+  - pre_tool_call
+  - post_tool_call
+  - transform_tool_result
+  - transform_final_response
+  - on_session_end

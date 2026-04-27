@@ -28,6 +28,7 @@ Platform: Linux / macOS only (Unix domain sockets for local). Disabled on Window
 Remote execution additionally requires Python 3 in the terminal backend.
 """
 
+import ast
 import base64
 import functools
 import json
@@ -52,17 +53,17 @@ logger = logging.getLogger(__name__)
 
 SANDBOX_AVAILABLE = sys.platform != "win32"
 
-# The 7 tools allowed inside the sandbox. The intersection of this list
+# The tools allowed inside the sandbox. The intersection of this list
 # and the session's enabled tools determines which stubs are generated.
 SANDBOX_ALLOWED_TOOLS = frozenset([
     "web_search",
     "web_extract",
     "read_file",
-    "write_file",
     "search_files",
-    "patch",
     "terminal",
 ])
+
+RAW_FILE_WRITE_ESCAPE = "HERMES_ALLOW_RAW_FILE_WRITES"
 
 # Resource limit defaults (overridable via config.yaml → code_execution.*)
 DEFAULT_TIMEOUT = 300        # 5 minutes
@@ -74,6 +75,124 @@ MAX_STDERR_BYTES = 10_000    # 10 KB
 def check_sandbox_requirements() -> bool:
     """Code execution sandbox requires a POSIX OS for Unix domain sockets."""
     return SANDBOX_AVAILABLE
+
+
+def _dotted_name(node: ast.AST) -> str:
+    """Return a dotted call/attribute name for simple AST nodes."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        parent = _dotted_name(node.value)
+        return f"{parent}.{node.attr}" if parent else node.attr
+    return ""
+
+
+def _literal_string(node: ast.AST | None) -> Optional[str]:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+def _path_literal(node: ast.AST | None, known_paths: Dict[str, str]) -> Optional[str]:
+    """Return a literal path for simple string/Path(...) expressions."""
+    if node is None:
+        return None
+    literal = _literal_string(node)
+    if literal is not None:
+        return literal
+    if isinstance(node, ast.Name):
+        return known_paths.get(node.id)
+    if isinstance(node, ast.Call) and _dotted_name(node.func) in {"Path", "pathlib.Path"}:
+        if node.args:
+            return _literal_string(node.args[0])
+    return None
+
+
+def _mode_writes(mode: str | None) -> bool:
+    """Return True when an open()/Path.open() mode can mutate the file."""
+    if mode is None:
+        return False
+    return any(ch in mode for ch in ("w", "a", "x", "+"))
+
+
+def _call_mode_arg(node: ast.Call, positional_index: int) -> Optional[str]:
+    if len(node.args) > positional_index:
+        return _literal_string(node.args[positional_index])
+    for kw in node.keywords:
+        if kw.arg == "mode":
+            return _literal_string(kw.value)
+    return None
+
+
+def _detect_raw_file_write(code: str) -> Optional[str]:
+    """Detect common raw Python file-write patterns that bypass file tools.
+
+    This is intentionally heuristic: it catches the model's common direct-edit
+    shapes while allowing unrelated scripts to fail naturally if Python syntax
+    is invalid or if paths are computed dynamically.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return None
+
+    known_paths: Dict[str, str] = {}
+
+    class Visitor(ast.NodeVisitor):
+        def __init__(self):
+            self.match: Optional[str] = None
+
+        def visit_Assign(self, node: ast.Assign) -> None:
+            path = _path_literal(node.value, known_paths)
+            if path is not None:
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        known_paths[target.id] = path
+            self.generic_visit(node)
+
+        def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+            path = _path_literal(node.value, known_paths)
+            if path is not None and isinstance(node.target, ast.Name):
+                known_paths[node.target.id] = path
+            self.generic_visit(node)
+
+        def visit_Call(self, node: ast.Call) -> None:
+            if self.match is not None:
+                return
+
+            call_name = _dotted_name(node.func)
+            if call_name in {"open", "io.open"}:
+                target = _path_literal(node.args[0], known_paths) if node.args else None
+                if target and _mode_writes(_call_mode_arg(node, 1)):
+                    self.match = f"open({target!r}, write mode)"
+                    return
+
+            if isinstance(node.func, ast.Attribute):
+                attr = node.func.attr
+                receiver_path = _path_literal(node.func.value, known_paths)
+                if attr == "open" and receiver_path and _mode_writes(_call_mode_arg(node, 0)):
+                    self.match = f"Path.open({receiver_path!r}, write mode)"
+                    return
+                if attr in {"write_text", "write_bytes"} and receiver_path:
+                    self.match = f"Path.{attr}({receiver_path!r})"
+                    return
+
+            self.generic_visit(node)
+
+    visitor = Visitor()
+    visitor.visit(tree)
+    return visitor.match
+
+
+def _raw_file_write_block_message(match: str) -> str:
+    return (
+        f"Raw Python file write blocked ({match}). Use edit_file for targeted "
+        "edits and write_file for creating or replacing files so Hermes can "
+        "track diffs, stale reads, checkpoints, and write safety. For an "
+        f"intentional generated-large-file write that is impractical as a tool "
+        f"argument, add a comment containing {RAW_FILE_WRITE_ESCAPE} and print "
+        "the written path plus byte count."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -929,6 +1048,11 @@ def execute_code(
     if not code or not code.strip():
         return tool_error("No code provided.")
 
+    if RAW_FILE_WRITE_ESCAPE not in code:
+        raw_write = _detect_raw_file_write(code)
+        if raw_write:
+            return tool_error(_raw_file_write_block_message(raw_write))
+
     # Dispatch: remote backends use file-based RPC, local uses UDS
     from tools.terminal_tool import _get_env_config
     env_type = _get_env_config()["env_type"]
@@ -1454,15 +1578,9 @@ _TOOL_DOC_LINES = [
     ("read_file",
      "  read_file(path: str, offset: int = 1, limit: int = 500) -> dict\n"
      "    Lines are 1-indexed. Returns {\"content\": \"...\", \"total_lines\": N}"),
-    ("write_file",
-     "  write_file(path: str, content: str) -> dict\n"
-     "    Always overwrites the entire file."),
     ("search_files",
      "  search_files(pattern: str, target=\"content\", path=\".\", file_glob=None, limit=50) -> dict\n"
      "    target: \"content\" (search inside files) or \"files\" (find files by name). Returns {\"matches\": [...]}"),
-    ("patch",
-     "  patch(path: str, old_string: str, new_string: str, replace_all: bool = False) -> dict\n"
-     "    Replaces old_string with new_string in the file."),
     ("terminal",
      "  terminal(command: str, timeout=None, workdir=None) -> dict\n"
      "    Foreground only (no background/pty). Returns {\"output\": \"...\", \"exit_code\": N}"),
@@ -1485,6 +1603,8 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
     """
     if enabled_sandbox_tools is None:
         enabled_sandbox_tools = SANDBOX_ALLOWED_TOOLS
+    else:
+        enabled_sandbox_tools = set(enabled_sandbox_tools) & SANDBOX_ALLOWED_TOOLS
     if mode is None:
         mode = _get_execution_mode()
 
@@ -1522,6 +1642,10 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
         "need to filter/reduce large tool outputs before they enter your context, "
         "need conditional branching (if X then Y else Z), or need to loop "
         "(fetch N pages, process N files, retry on failure).\n\n"
+        "Do not use this for normal file edits. Use the dedicated file-editing "
+        "tools for existing files or new small files; raw Python file writes are "
+        f"blocked unless the script includes {RAW_FILE_WRITE_ESCAPE} for an "
+        "intentional generated-large-file write.\n\n"
         "Use normal tool calls instead when: single tool call with no processing, "
         "you need to see the full result and apply complex reasoning, "
         "or the task requires interactive user input.\n\n"

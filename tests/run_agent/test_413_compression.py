@@ -79,7 +79,8 @@ def _make_413_error(*, use_status_code=True, message="Request entity too large")
 
 
 @pytest.fixture()
-def agent():
+def agent(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     with (
         patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
         patch("run_agent.check_toolset_requirements", return_value={}),
@@ -339,6 +340,85 @@ class TestHTTP413Compression:
 
         mock_compress.assert_called_once()
         assert result["completed"] is True
+
+    def test_generic_context_overflow_does_not_shrink_context_length(self, agent):
+        """Generic overflow should compress/retry without mutating context_length."""
+        err_400 = Exception("Error code: 400 - prompt is too long")
+        err_400.status_code = 400
+        ok_resp = _mock_response(content="Recovered", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [err_400, ok_resp]
+        original_ctx = agent.context_compressor.context_length
+
+        with (
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent.context_compressor, "update_model") as mock_update_model,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            mock_compress.return_value = (
+                [{"role": "user", "content": "compressed summary"}],
+                "compressed prompt",
+            )
+            result = agent.run_conversation("hello")
+
+        assert agent.context_compressor.context_length == original_ctx
+        mock_update_model.assert_not_called()
+
+    def test_overflow_compaction_uses_last_successful_snapshot(self, agent):
+        """Overflow compaction should pass the last successful request snapshot through."""
+        agent._last_successful_request_snapshot = {
+            "model": "test/model",
+            "messages": [{"role": "user", "content": "snapshot request"}],
+            "system_prompt": "snapshot system",
+            "tools": _make_tool_defs("web_search"),
+            "approx_tokens": 120,
+            "provider_tokens": 120,
+        }
+        err_400 = Exception("Error code: 400 - prompt is too long")
+        err_400.status_code = 400
+        ok_resp = _mock_response(content="Recovered", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [err_400, ok_resp]
+
+        captured = {}
+
+        def _compress(messages, current_tokens=None, focus_topic=None, **kwargs):
+            captured.update(kwargs)
+            return [{"role": "user", "content": "compressed summary"}]
+
+        def _estimate(messages, **_kwargs):
+            if messages and messages[0].get("content") == "compressed summary":
+                return 10
+            return 1000
+
+        with (
+            patch.object(agent.context_compressor, "compress", side_effect=_compress),
+            patch("run_agent.estimate_request_tokens_rough", side_effect=_estimate),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert captured.get("overflow_mode") is True
+        assert captured.get("overflow_snapshot", {}).get("messages")
+        assert captured["overflow_snapshot"]["messages"][0]["content"] == "snapshot request"
+
+    def test_last_successful_snapshot_keeps_canonical_messages_separate_from_api_payload(self, agent):
+        agent._capture_last_successful_request_snapshot(
+            model="test/model",
+            messages=[{"role": "user", "content": "canonical request"}],
+            api_messages=[{"role": "user", "content": "api-shaped request"}],
+            system_prompt="system",
+            tools=_make_tool_defs("web_search"),
+            approx_tokens=10,
+            provider_tokens=9,
+        )
+
+        snapshot = agent._last_successful_request_snapshot
+        assert snapshot["messages"][0]["content"] == "canonical request"
+        assert snapshot["api_messages"][0]["content"] == "api-shaped request"
 
     def test_context_length_retry_rebuilds_request_after_compression(self, agent):
         """Retry must send the compressed transcript, not the stale oversized payload."""

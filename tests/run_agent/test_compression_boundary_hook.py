@@ -123,6 +123,48 @@ class TestCompressionBoundaryHook:
             f"got {comp_calls!r}"
         )
 
+    def test_todo_snapshot_is_not_appended_as_latest_user_message(self):
+        """Todo preservation must not become the active post-summary request."""
+        from agent.context_compressor import SUMMARY_PREFIX
+        from run_agent import AIAgent
+
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
+            agent = AIAgent(
+                api_key="test-key",
+                base_url="https://openrouter.ai/api/v1",
+                model="test/model",
+                quiet_mode=True,
+                session_db=None,
+                session_id="original-session",
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+        compressor = MagicMock()
+        compressor.compress.return_value = [
+            {"role": "user", "content": f"{SUMMARY_PREFIX}\nsummary"},
+            {"role": "user", "content": "tail question"},
+        ]
+        compressor.compression_count = 1
+        compressor.last_prompt_tokens = 0
+        compressor.last_completion_tokens = 0
+        compressor._last_summary_error = None
+        agent.context_compressor = compressor
+        agent._todo_store.write([
+            {"id": "1", "content": "finish the patch", "status": "in_progress"},
+        ])
+
+        compressed, _ = agent._compress_context(
+            [{"role": "user", "content": "m"}],
+            "sys",
+            approx_tokens=100,
+        )
+
+        assert len(compressed) == 2
+        assert "Preserved Active Todo List" in compressed[0]["content"]
+        assert "finish the patch" in compressed[0]["content"]
+        assert compressed[-1] == {"role": "user", "content": "tail question"}
+
     def test_hook_failure_does_not_break_compression(self):
         """If the context engine raises from on_session_start, compression still completes."""
         from hermes_state import SessionDB

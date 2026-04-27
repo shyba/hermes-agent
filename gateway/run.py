@@ -14,6 +14,7 @@ Usage:
 """
 
 import asyncio
+import concurrent.futures
 import dataclasses
 import json
 import logging
@@ -691,6 +692,44 @@ def _resolve_gateway_model(config: dict | None = None) -> str:
     elif isinstance(model_cfg, dict):
         return model_cfg.get("default") or model_cfg.get("model") or ""
     return ""
+
+
+def _compression_history_to_agent_messages(
+    history: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Convert stored gateway transcript rows into compression-safe messages.
+
+    Manual and hygiene compression need the same rich history shape as the
+    normal agent run path. Dropping assistant tool_calls or tool results before
+    summarization removes the evidence the compaction summary is supposed to
+    preserve.
+    """
+    messages: list[dict[str, Any]] = []
+    for msg in history:
+        role = msg.get("role")
+        if not role or role in ("system", "session_meta"):
+            continue
+
+        has_tool_calls = "tool_calls" in msg
+        has_tool_call_id = "tool_call_id" in msg
+        is_tool_message = role == "tool"
+        if has_tool_calls or has_tool_call_id or is_tool_message:
+            messages.append({k: v for k, v in msg.items() if k != "timestamp"})
+            continue
+
+        if role not in ("user", "assistant"):
+            continue
+        content = msg.get("content")
+        if not content:
+            continue
+        entry = {"role": role, "content": content}
+        if role == "assistant":
+            for key in ("reasoning", "reasoning_details", "codex_reasoning_items"):
+                value = msg.get(key)
+                if value:
+                    entry[key] = value
+        messages.append(entry)
+    return messages
 
 
 def _resolve_hermes_bin() -> Optional[list[str]]:
@@ -4904,12 +4943,7 @@ class GatewayRunner:
                             user_config=_hyg_data if isinstance(_hyg_data, dict) else None,
                         )
                         if _hyg_runtime.get("api_key"):
-                            _hyg_msgs = [
-                                {"role": m.get("role"), "content": m.get("content")}
-                                for m in history
-                                if m.get("role") in ("user", "assistant")
-                                and m.get("content")
-                            ]
+                            _hyg_msgs = _compression_history_to_agent_messages(history)
 
                             if len(_hyg_msgs) >= 4:
                                 _hyg_agent = AIAgent(
@@ -4925,13 +4959,17 @@ class GatewayRunner:
                                     _hyg_agent._print_fn = lambda *a, **kw: None
 
                                     loop = asyncio.get_running_loop()
-                                    _compressed, _ = await loop.run_in_executor(
-                                        None,
-                                        lambda: _hyg_agent._compress_context(
-                                            _hyg_msgs, "",
-                                            approx_tokens=_approx_tokens,
-                                        ),
-                                    )
+                                    with concurrent.futures.ThreadPoolExecutor(
+                                        max_workers=1,
+                                        thread_name_prefix="hermes-compress",
+                                    ) as pool:
+                                        _compressed, _ = await loop.run_in_executor(
+                                            pool,
+                                            lambda: _hyg_agent._compress_context(
+                                                _hyg_msgs, "",
+                                                approx_tokens=_approx_tokens,
+                                            ),
+                                        )
 
                                     # _compress_context ends the old session and creates
                                     # a new session_id.  Write compressed messages into
@@ -5208,7 +5246,7 @@ class GatewayRunner:
                 if _is_ctx_fail:
                     response = (
                         "⚠️ Session too large for the model's context window.\n"
-                        "Use /compact to compress the conversation, or "
+                        "Use /compress to compress the conversation, or "
                         "/reset to start fresh."
                     )
                 else:
@@ -5497,7 +5535,7 @@ class GatewayRunner:
                 if _hist_len > 50:
                     return (
                         "⚠️ Session too large for the model's context window.\n"
-                        "Use /compact to compress the conversation, or "
+                        "Use /compress to compress the conversation, or "
                         "/reset to start fresh."
                     )
                 elif status_code == 400:
@@ -7608,11 +7646,7 @@ class GatewayRunner:
             if not runtime_kwargs.get("api_key"):
                 return "No provider configured -- cannot compress."
 
-            msgs = [
-                {"role": m.get("role"), "content": m.get("content")}
-                for m in history
-                if m.get("role") in ("user", "assistant") and m.get("content")
-            ]
+            msgs = _compression_history_to_agent_messages(history)
             approx_tokens = estimate_messages_tokens_rough(msgs)
 
             tmp_agent = AIAgent(
@@ -7632,10 +7666,19 @@ class GatewayRunner:
                     return "Nothing to compress yet (the transcript is still all protected context)."
 
                 loop = asyncio.get_running_loop()
-                compressed, _ = await loop.run_in_executor(
-                    None,
-                    lambda: tmp_agent._compress_context(msgs, "", approx_tokens=approx_tokens, focus_topic=focus_topic)
-                )
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="hermes-compress",
+                ) as pool:
+                    compressed, _ = await loop.run_in_executor(
+                        pool,
+                        lambda: tmp_agent._compress_context(
+                            msgs,
+                            "",
+                            approx_tokens=approx_tokens,
+                            focus_topic=focus_topic,
+                        ),
+                    )
 
                 # _compress_context already calls end_session() on the old session
                 # (preserving its full transcript in SQLite) and creates a new

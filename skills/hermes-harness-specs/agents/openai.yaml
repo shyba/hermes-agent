@@ -1,0 +1,4 @@
+interface:
+  display_name: "OpenSpec Change Specs"
+  short_description: "Write and validate OpenSpec-compatible change artifacts"
+  default_prompt: "Draft OpenSpec-compatible artifacts for this task: proposal.md, tasks.md, specs/<capability>/spec.md, and optional design.md. Put Hermes-specific completion evidence in the tasks.md Completion Gate."

@@ -1,0 +1,3 @@
+{"s":1,"t":"run","event":"created","run":"harness-fixture-blocked","ok":true}
+{"s":2,"t":"sensor","id":"events.corruption","covers":["ac1"],"after":1,"ok":false,"error":"events module not implemented"}
+{"s":3,"t":"finalization","status":"blocked","blocking":["ev2"],"ok":true}

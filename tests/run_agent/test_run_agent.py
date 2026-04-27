@@ -921,6 +921,35 @@ class TestBuildSystemPrompt:
         assert mock_skills.call_args.kwargs["available_tools"] == set(toolset_map)
         assert mock_skills.call_args.kwargs["available_toolsets"] == {"web", "skills"}
 
+    def test_parallel_tool_guidance_when_multiple_parallel_tools_loaded(self):
+        from agent.prompt_builder import PARALLEL_TOOL_CALL_GUIDANCE
+
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs("web_search", "web_extract"),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            agent = AIAgent(
+                model="anthropic/claude-sonnet-4",
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+        prompt = agent._build_system_prompt()
+        assert PARALLEL_TOOL_CALL_GUIDANCE in prompt
+
+    def test_no_parallel_tool_guidance_with_only_one_parallel_tool(self, agent):
+        from agent.prompt_builder import PARALLEL_TOOL_CALL_GUIDANCE
+
+        prompt = agent._build_system_prompt()
+        assert PARALLEL_TOOL_CALL_GUIDANCE not in prompt
+
 
 class TestToolUseEnforcementConfig:
     """Tests for the agent.tool_use_enforcement config option."""
@@ -2190,6 +2219,71 @@ class TestRunConversation:
         assert result["final_response"] == "Final answer"
         assert result["completed"] is True
 
+    def test_reuses_identical_pending_user_message_on_retry(self, agent):
+        self._setup_agent(agent)
+        pending = "Do the task\n\n--- Attached Context ---\n\n📄 @file:prd.json (10 tokens)\n```json\n{}\n```"
+        resp = _mock_response(content="Done", finish_reason="stop")
+        agent.client.chat.completions.create.return_value = resp
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                pending,
+                conversation_history=[{"role": "user", "content": pending}],
+            )
+
+        user_messages = [m for m in result["messages"] if m.get("role") == "user"]
+        assert len(user_messages) == 1
+        assert user_messages[0]["content"] == pending
+        sent_messages = agent.client.chat.completions.create.call_args.kwargs["messages"]
+        sent_user_messages = [m for m in sent_messages if m.get("role") == "user"]
+        assert len(sent_user_messages) == 1
+
+    def test_minimax_preflight_hygiene_compacts_older_same_file_context(self, agent):
+        self._setup_agent(agent)
+        agent.compression_enabled = True
+        agent.provider = "minimax"
+        agent.base_url = "https://api.minimax.io/anthropic"
+        agent.context_compressor.context_length = 204_800
+        agent.context_compressor.threshold_tokens = 1000
+
+        old_prd = (
+            "Old PRD task\n\n--- Attached Context ---\n\n"
+            "📄 @file:prd.json (40000 tokens)\n```json\n"
+            + ("X" * 40000)
+            + "\n```"
+        )
+        new_prd = (
+            "New PRD task\n\n--- Attached Context ---\n\n"
+            "📄 @file:prd.json (45000 tokens)\n```json\n"
+            + ("Y" * 4000)
+            + "\n```"
+        )
+        resp = _mock_response(content="Done", finish_reason="stop")
+        agent.client.chat.completions.create.return_value = resp
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                new_prd,
+                conversation_history=[
+                    {"role": "user", "content": old_prd},
+                    {"role": "assistant", "content": "handled old"},
+                ],
+            )
+
+        assert result["completed"] is True
+        sent_messages = agent.client.chat.completions.create.call_args.kwargs["messages"]
+        user_contents = [m.get("content", "") for m in sent_messages if m.get("role") == "user"]
+        assert any("[large user context compacted]" in content for content in user_contents)
+        assert user_contents[-1] == new_prd
+
     def test_tool_calls_then_stop(self, agent):
         self._setup_agent(agent)
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
@@ -2709,16 +2803,36 @@ class TestRunConversation:
         assert result["final_response"] == "Recovered after compression"
         assert result["completed"] is True
 
-    def test_minimax_delta_overflow_keeps_known_context_length(self, agent):
-        """MiniMax reports overflow deltas like 'limit (2013)' without the real window.
-
-        Keep the known 204,800-token window and compress instead of probing down
-        to the generic 128K fallback tier.
-        """
+    def test_minimax_preflight_caps_output_to_total_context_window(self, agent):
+        """MiniMax's 204,800-token limit is input + requested output."""
         self._setup_agent(agent)
         agent.provider = "minimax"
         agent.model = "MiniMax-M2.7-highspeed"
         agent.base_url = "https://api.minimax.io/anthropic"
+        agent.context_compressor.context_length = 204_800
+        agent.context_compressor.threshold_tokens = int(
+            agent.context_compressor.context_length * agent.context_compressor.threshold_percent
+        )
+
+        original_kwargs = {"model": "MiniMax-M2.7", "max_tokens": 131_072}
+        capped = agent._cap_minimax_total_context_output(
+            original_kwargs,
+            estimated_input_tokens=130_339,
+        )
+
+        assert capped is not original_kwargs
+        assert original_kwargs["max_tokens"] == 131_072
+        assert capped["max_tokens"] == 72_413
+        assert agent._last_request_max_output_tokens == 72_413
+        assert agent.context_compressor.context_length == 204_800
+
+    def test_minimax_error_after_safe_cap_compresses_without_delta_decrement(self, agent):
+        """MiniMax '(2013)' is an error code, not a token overage delta."""
+        self._setup_agent(agent)
+        agent.provider = "minimax"
+        agent.model = "MiniMax-M2.7-highspeed"
+        agent.base_url = "https://api.minimax.io/anthropic"
+        agent.max_tokens = 131_072
         agent.context_compressor.context_length = 204_800
         agent.context_compressor.threshold_tokens = int(
             agent.context_compressor.context_length * agent.context_compressor.threshold_percent
@@ -2730,12 +2844,10 @@ class TestRunConversation:
         err_400.status_code = 400
         ok_resp = _mock_response(content="Recovered after compression", finish_reason="stop")
         agent.client.chat.completions.create.side_effect = [err_400, ok_resp]
-        prefill = [
-            {"role": "user", "content": "previous question"},
-            {"role": "assistant", "content": "previous answer"},
-        ]
 
         with (
+            patch("run_agent.estimate_request_tokens_rough", side_effect=[130_339, 130_339, 100, 100]),
+            patch("run_agent.time.sleep"),
             patch.object(agent, "_compress_context") as mock_compress,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
@@ -2745,16 +2857,20 @@ class TestRunConversation:
                 [{"role": "user", "content": "hello"}],
                 "compressed system prompt",
             )
-            result = agent.run_conversation("hello", conversation_history=prefill)
+            result = agent.run_conversation("hello")
 
         mock_compress.assert_called_once()
+        first_kwargs = agent.client.chat.completions.create.call_args_list[0].kwargs
+        retry_kwargs = agent.client.chat.completions.create.call_args_list[1].kwargs
+        assert first_kwargs["max_tokens"] == 72_413
+        assert retry_kwargs["max_tokens"] == 72_413
         assert agent.context_compressor.context_length == 204_800
         assert agent.context_compressor._context_probed is False
         assert result["final_response"] == "Recovered after compression"
         assert result["completed"] is True
 
-    def test_non_minimax_delta_overflow_still_probes_down(self, agent):
-        """Non-MiniMax providers should keep the generic probe-down behavior."""
+    def test_non_minimax_delta_overflow_compresses_without_probe_down(self, agent):
+        """Generic delta-shaped overflow should compress without fake context shrink."""
         self._setup_agent(agent)
         agent.provider = "openrouter"
         agent.model = "some/unknown-model"
@@ -2788,7 +2904,7 @@ class TestRunConversation:
             result = agent.run_conversation("hello", conversation_history=prefill)
 
         mock_compress.assert_called_once()
-        assert agent.context_compressor.context_length == 128_000
+        assert agent.context_compressor.context_length == 200_000
         assert result["final_response"] == "Recovered after compression"
         assert result["completed"] is True
 

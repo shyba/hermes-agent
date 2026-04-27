@@ -1,0 +1,10 @@
+version: "1"
+guides:
+  - id: first-slice
+    description: "Keep harness changes low risk and plugin-local."
+sensors:
+  - id: tests.focused
+    command: "scripts/run_tests.sh tests/plugins/test_harness_plugin.py tests/harness/test_harness_events.py"
+    covers:
+      - ac1
+      - ac2

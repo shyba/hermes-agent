@@ -5,8 +5,8 @@ Covers:
   - the resize handler we install over prompt_toolkit's _on_resize (#5474)
 
 Both behaviors are exercised against fake prompt_toolkit renderer/output
-objects — we're asserting the escape sequences the CLI sends, not that
-the terminal physically repainted.
+objects.  For manual redraw we assert the full clear sequence; for resize
+we assert that the full clear sequence is not sent.
 """
 
 from unittest.mock import MagicMock
@@ -71,3 +71,34 @@ class TestForceFullRedraw:
         bare_cli._app = app
 
         bare_cli._force_full_redraw()  # must not raise
+
+
+class TestResizeHandler:
+    def test_resize_preserves_terminal_history(self, bare_cli):
+        app = MagicMock()
+        original_on_resize = MagicMock()
+        app._on_resize = original_on_resize
+
+        bare_cli._install_resize_handler(app)
+        app._on_resize()
+
+        original_on_resize.assert_called_once()
+        app.invalidate.assert_called_once()
+        app.renderer.reset.assert_not_called()
+
+        out = app.renderer.output
+        out.reset_attributes.assert_not_called()
+        out.erase_screen.assert_not_called()
+        out.cursor_goto.assert_not_called()
+        out.flush.assert_not_called()
+
+    def test_resize_swallows_invalidate_exceptions(self, bare_cli):
+        app = MagicMock()
+        original_on_resize = MagicMock()
+        app._on_resize = original_on_resize
+        app.invalidate.side_effect = RuntimeError("invalidate failed")
+
+        bare_cli._install_resize_handler(app)
+        app._on_resize()  # must not raise
+
+        original_on_resize.assert_called_once()

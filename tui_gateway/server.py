@@ -2387,6 +2387,7 @@ def _(rid, params: dict) -> dict:
     def run():
         approval_token = None
         session_tokens = []
+        pending_followup = None
         try:
             from tools.approval import (
                 reset_current_session_key,
@@ -2523,6 +2524,9 @@ def _(rid, params: dict) -> dict:
                                 "but was not saved to session history."
                             )
                 raw = result.get("final_response", "")
+                followup = result.get("pending_steer")
+                if isinstance(followup, str) and followup.strip():
+                    pending_followup = followup.strip()
                 status = (
                     "interrupted"
                     if result.get("interrupted")
@@ -2540,6 +2544,8 @@ def _(rid, params: dict) -> dict:
                 payload["reasoning"] = last_reasoning
             if status_note:
                 payload["warning"] = status_note
+            if pending_followup:
+                payload["pending_steer"] = pending_followup
             rendered = render_message(raw, cols)
             if rendered:
                 payload["rendered"] = rendered
@@ -2613,6 +2619,22 @@ def _(rid, params: dict) -> dict:
             _clear_session_context(session_tokens)
             with session["history_lock"]:
                 session["running"] = False
+            if pending_followup:
+                _emit(
+                    "status.update",
+                    sid,
+                    {
+                        "kind": "continuation",
+                        "text": "Harness requested another turn; continuing automatically.",
+                    },
+                )
+                try:
+                    _methods["prompt.submit"](
+                        f"auto-{uuid.uuid4().hex}",
+                        {"session_id": sid, "text": pending_followup},
+                    )
+                except Exception as exc:
+                    logger.warning("TUI pending follow-up dispatch failed: %s", exc)
 
     threading.Thread(target=run, daemon=True).start()
     return _ok(rid, {"status": "streaming"})

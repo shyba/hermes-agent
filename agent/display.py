@@ -425,7 +425,7 @@ def extract_edit_diff(
             if isinstance(diff, str) and diff.strip():
                 return diff
 
-    if tool_name not in {"write_file", "patch", "skill_manage"}:
+    if tool_name not in {"write_file", "edit_file", "patch", "skill_manage"}:
         return None
     if not _result_succeeded(result):
         return None
@@ -998,5 +998,4 @@ def get_cute_tool_message(
 # =========================================================================
 # Honcho session line (one-liner with clickable OSC 8 hyperlink)
 # =========================================================================
-
 

@@ -243,3 +243,52 @@ async def test_compress_command_surfaces_aux_model_failure_even_when_recovered()
     assert "intact" in result
     agent_instance.shutdown_memory_provider.assert_called_once()
     agent_instance.close.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_compress_command_preserves_tool_history_for_summary():
+    history = [
+        {"role": "user", "content": "inspect config"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": '{"path": "config.py"}',
+                    },
+                },
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "CRITICAL_FINDING: config flag is inverted",
+        },
+        {"role": "assistant", "content": "I found the issue."},
+    ]
+    runner = _make_runner(history)
+    agent_instance = MagicMock()
+    agent_instance.shutdown_memory_provider = MagicMock()
+    agent_instance.close = MagicMock()
+    agent_instance.context_compressor.has_content_to_compress.return_value = True
+    agent_instance.session_id = "sess-1"
+    agent_instance._compress_context.return_value = (list(history), "")
+
+    with (
+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "test-key"}),
+        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+        patch("run_agent.AIAgent", return_value=agent_instance),
+        patch("agent.model_metadata.estimate_messages_tokens_rough", return_value=100),
+    ):
+        await runner._handle_compress_command(_make_event())
+
+    compressed_input = agent_instance._compress_context.call_args.args[0]
+    assert compressed_input[1]["tool_calls"][0]["id"] == "call_1"
+    assert compressed_input[2]["role"] == "tool"
+    assert "CRITICAL_FINDING" in compressed_input[2]["content"]
+    agent_instance.shutdown_memory_provider.assert_called_once()
+    agent_instance.close.assert_called_once()

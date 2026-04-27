@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 from tools.file_tools import (
     READ_FILE_SCHEMA,
     WRITE_FILE_SCHEMA,
+    EDIT_FILE_SCHEMA,
     PATCH_SCHEMA,
     SEARCH_FILES_SCHEMA,
 )
@@ -106,6 +107,29 @@ class TestWriteFileHandler:
 
 
 class TestPatchHandler:
+    @patch("tools.file_tools._get_file_ops")
+    def test_edit_file_calls_patch_replace(self, mock_get):
+        mock_ops = MagicMock()
+        result_obj = MagicMock()
+        result_obj.to_dict.return_value = {"status": "ok", "replacements": 1}
+        mock_ops.patch_replace.return_value = result_obj
+        mock_get.return_value = mock_ops
+
+        from tools.file_tools import edit_file_tool
+        result = json.loads(edit_file_tool(
+            path="/tmp/f.py",
+            old_text="foo",
+            new_text="bar",
+        ))
+        assert result["status"] == "ok"
+        mock_ops.patch_replace.assert_called_once_with("/tmp/f.py", "foo", "bar", False)
+
+    def test_edit_file_schema_prefers_normal_code_edits(self):
+        desc = EDIT_FILE_SCHEMA["description"]
+        assert "Preferred tool" in desc
+        assert "execute_code" in desc
+        assert "Python open()" in desc
+
     @patch("tools.file_tools._get_file_ops")
     def test_replace_mode_calls_patch_replace(self, mock_get):
         mock_ops = MagicMock()
@@ -321,6 +345,5 @@ class TestSearchHints:
         raw = search_tool(pattern="foo", offset=50, limit=50)
         assert "[Hint:" in raw
         assert "offset=100" in raw
-
 
 

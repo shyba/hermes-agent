@@ -2256,6 +2256,34 @@ class HermesCLI:
         except Exception:
             pass
 
+    def _install_resize_handler(self, app) -> None:
+        """Install a resize handler that preserves terminal scrollback.
+
+        prompt_toolkit's native resize handling erases the current prompt
+        region, recalculates terminal dimensions, and redraws the live prompt.
+        We deliberately do not clear the whole terminal here.  Automatic
+        full-screen clears make normal tmux resize events look like transcript
+        loss; Ctrl+L and /redraw remain available for manual recovery when a
+        terminal multiplexer leaves stale rows.
+
+        Do not reset the renderer after the original resize callback returns:
+        by then prompt_toolkit has already redrawn and stored the fresh cursor
+        position.  Resetting it at that point makes the next spinner/status
+        refresh paint below the previous one, producing repeated ghost bars.
+        """
+        original_on_resize = app._on_resize
+
+        def _resize_refresh_without_clearing():
+            try:
+                original_on_resize()
+            finally:
+                try:
+                    app.invalidate()
+                except Exception:
+                    pass
+
+        app._on_resize = _resize_refresh_without_clearing
+
     def _status_bar_context_style(self, percent_used: Optional[int]) -> str:
         if percent_used is None:
             return "class:status-bar-dim"
@@ -10823,42 +10851,7 @@ class HermesCLI:
         )
         self._app = app  # Store reference for clarify_callback
 
-        # ── Fix ghost status-bar lines on terminal resize ──────────────
-        # When the terminal shrinks (e.g. un-maximize), the emulator reflows
-        # the previously-rendered full-width rows (status bar, input rules)
-        # into multiple narrower rows.  prompt_toolkit's _on_resize handler
-        # only cursor_up()s by the stored layout height, missing the extra
-        # rows created by reflow — leaving ghost duplicates visible.
-        #
-        # It's not just column-shrink: widening, row-shrinking, and
-        # multiplexer-driven SIGWINCH-less redraws (cmux / tmux tab switch)
-        # all produce the same class of drift, where the renderer's tracked
-        # _cursor_pos.y no longer matches terminal reality. The only reliable
-        # recovery is a full screen-clear (\x1b[2J\x1b[H) before the next
-        # redraw, so we force one on every resize rather than trying to
-        # compute the exact drift.
-        _original_on_resize = app._on_resize
-
-        def _resize_clear_ghosts():
-            renderer = app.renderer
-            try:
-                out = renderer.output
-                # Reset attributes, erase the entire screen, and home the
-                # cursor. This overwrites any reflowed status-bar rows or
-                # stale content the terminal kept from the prior layout.
-                out.reset_attributes()
-                out.erase_screen()
-                out.cursor_goto(0, 0)
-                out.flush()
-                # Tell the renderer its tracked position is fresh so its
-                # own erase() inside _on_resize doesn't cursor_up() past
-                # the top of the screen.
-                renderer.reset(leave_alternate_screen=False)
-            except Exception:
-                pass  # never break resize handling
-            _original_on_resize()
-
-        app._on_resize = _resize_clear_ghosts
+        self._install_resize_handler(app)
 
         def spinner_loop():
             while not self._should_exit:

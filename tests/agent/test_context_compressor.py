@@ -92,6 +92,395 @@ class TestCompress:
         # original content is present in either case.
         assert msgs[-2]["content"] in result[-2]["content"]
 
+    def test_summary_prompt_sees_unpruned_tool_output(self):
+        """Pruning final transcript tool output must not starve the summarizer.
+
+        Regression: old tool results were replaced with one-line summaries
+        before `_generate_summary()`, so the auxiliary LLM never saw the actual
+        finding it needed to preserve.
+        """
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "summary text"
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=2,
+                protect_last_n=2,
+            )
+        c.tail_token_budget = 10
+
+        tool_output = "CRITICAL_FINDING: config flag is inverted\n" + ("x" * 600)
+        msgs = [
+            {"role": "user", "content": "start"},
+            {"role": "assistant", "content": "ack"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": '{"path": "config.py"}',
+                        },
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": tool_output},
+            {"role": "assistant", "content": "noted"},
+            {"role": "user", "content": "next"},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "latest ask"},
+        ]
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response) as mock_call:
+            c.compress(msgs, current_tokens=90_000)
+
+        prompt = mock_call.call_args.kwargs["messages"][0]["content"]
+        assert "CRITICAL_FINDING: config flag is inverted" in prompt
+        assert "[read_file] read config.py" not in prompt
+
+    def test_overflow_does_not_tombstone_when_summary_request_fits(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "summary text"
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=2,
+                protect_last_n=2,
+            )
+
+        tool_output = "CRITICAL_HEAD\n" + ("X" * 400000) + "\nCRITICAL_TAIL"
+        msgs = [
+            {"role": "user", "content": "start"},
+            {"role": "assistant", "content": "ack"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": '{"path": "huge.txt"}',
+                    },
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": tool_output},
+            {"role": "assistant", "content": "noted"},
+            {"role": "user", "content": "next"},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "latest ask"},
+        ]
+
+        with (
+            patch("agent.context_compressor.call_llm", return_value=mock_response) as mock_call,
+            patch.object(c, "_summary_input_token_budget", return_value=100000),
+        ):
+            c.compress(msgs, current_tokens=90_000, overflow_mode=True)
+
+        prompt = mock_call.call_args.kwargs["messages"][0]["content"]
+        assert "[tool result compacted]" not in prompt
+        assert "CRITICAL_HEAD" in prompt
+
+    def test_overflow_tombstones_tool_output_when_summary_request_exceeds_budget(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "summary text"
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=2,
+                protect_last_n=2,
+            )
+
+        msgs = [
+            {"role": "user", "content": "start"},
+            {"role": "assistant", "content": "ack"},
+        ]
+        for idx in range(2):
+            call_id = f"call_{idx}"
+            msgs.extend([
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": f'{{"path": "huge_{idx}.txt"}}',
+                        },
+                    }],
+                },
+                {"role": "tool", "tool_call_id": call_id, "content": "X" * 50000},
+                {"role": "assistant", "content": f"noted {idx}"},
+            ])
+        msgs.extend([
+            {"role": "user", "content": "next"},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "latest ask"},
+        ])
+
+        with (
+            patch("agent.context_compressor.call_llm", return_value=mock_response) as mock_call,
+            patch.object(c, "_summary_input_token_budget", return_value=1000),
+        ):
+            c.compress(msgs, current_tokens=90_000, overflow_mode=True)
+
+        prompt = mock_call.call_args.kwargs["messages"][0]["content"]
+        assert "[tool result compacted]" in prompt
+        assert "tool: read_file" in prompt
+        assert "tool_call_id: call_0" in prompt or "tool_call_id: call_1" in prompt
+
+    def test_overflow_tombstones_retained_tail_tool_output(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "summary text"
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=2,
+                protect_last_n=2,
+            )
+        c.threshold_tokens = 1000
+
+        msgs = [
+            {"role": "user", "content": "start"},
+            {"role": "assistant", "content": "ack"},
+            {"role": "user", "content": "middle"},
+            {"role": "assistant", "content": "middle ack"},
+            {"role": "user", "content": "latest request"},
+            {"role": "assistant", "content": "will run command"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_tail",
+                    "type": "function",
+                    "function": {
+                        "name": "terminal",
+                        "arguments": '{"cmd": "cat huge.log"}',
+                    },
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_tail", "content": "X" * 200000},
+        ]
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            result = c.compress(msgs, current_tokens=90_000, overflow_mode=True)
+
+        tool_msg = next(m for m in result if m.get("role") == "tool")
+        assert "[tool result compacted]" in tool_msg["content"]
+        assert "tool: terminal" in tool_msg["content"]
+        assert "refetchable: no" in tool_msg["content"]
+        assert "do not rerun side-effecting tools" in tool_msg["content"]
+
+    def test_overflow_compacts_stale_large_user_context_in_protected_head(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "summary text"
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=2,
+                protect_last_n=2,
+            )
+        c.threshold_tokens = 1000
+
+        old_context = (
+            "Review this old PRD\n\n--- Attached Context ---\n\n"
+            "📄 @file:prd.json (50000 tokens)\n```json\n"
+            + ("X" * 120000)
+            + "\n```"
+        )
+        latest_context = "Current request with @file:prd.json content must remain intact"
+        msgs = [
+            {"role": "user", "content": old_context},
+            {"role": "assistant", "content": "ack"},
+            {"role": "user", "content": "middle"},
+            {"role": "assistant", "content": "middle ack"},
+            {"role": "user", "content": latest_context},
+            {"role": "assistant", "content": "working"},
+            {"role": "user", "content": latest_context},
+        ]
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            result = c.compress(msgs, current_tokens=90_000, overflow_mode=True)
+
+        assert "[large user context compacted]" in result[0]["content"]
+        assert "original_size:" in result[0]["content"]
+        assert result[-1]["content"] == latest_context
+
+    def test_overflow_compacts_duplicate_pending_user_context(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+
+        huge_user = (
+            "Task\n\n--- Attached Context ---\n\n"
+            "📄 @file:prd.json (60000 tokens)\n```json\n"
+            + ("X" * 60000)
+            + "\n```"
+        )
+        msgs = [
+            {"role": "user", "content": huge_user},
+            {"role": "assistant", "content": "summary"},
+            {"role": "user", "content": huge_user},
+            {"role": "user", "content": huge_user},
+        ]
+
+        result = c._compact_stale_large_user_messages(msgs, target_tokens=1000)
+
+        compacted = [m for m in result if "[large user context compacted]" in str(m.get("content"))]
+        assert len(compacted) >= 1
+        assert result[-1]["content"] == huge_user
+        assert "duplicate_of_later_user_message: yes" in compacted[0]["content"]
+        assert "older_duplicate_file_path: yes" in compacted[0]["content"]
+        assert "attached_files: prd.json" in compacted[0]["content"]
+
+    def test_overflow_compacts_older_same_file_context_by_path(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+
+        old_prd = (
+            "Old task\n\n--- Attached Context ---\n\n"
+            "📄 @file:prd.json (400 tokens)\n```json\nold version\n```"
+        )
+        new_prd = (
+            "New task\n\n--- Attached Context ---\n\n"
+            "📄 @file:prd.json (450 tokens)\n```json\nnew version\n```"
+        )
+        msgs = [
+            {"role": "user", "content": old_prd},
+            {"role": "assistant", "content": "handled old"},
+            {"role": "user", "content": "unrelated"},
+            {"role": "user", "content": new_prd},
+        ]
+
+        result = c._compact_stale_large_user_messages(msgs, target_tokens=999999)
+
+        assert "[large user context compacted]" in result[0]["content"]
+        assert "older_duplicate_file_path: yes" in result[0]["content"]
+        assert "attached_files: prd.json" in result[0]["content"]
+        assert result[-1]["content"] == new_prd
+
+    def test_overflow_tombstones_large_tool_output(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=2,
+                protect_last_n=2,
+            )
+
+        tool_output = "X" * 400000
+        msgs = [
+            {"role": "user", "content": "start"},
+            {"role": "assistant", "content": "ack"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": '{"path": "config.py"}',
+                        },
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": tool_output},
+            {"role": "assistant", "content": "noted"},
+            {"role": "user", "content": "latest ask"},
+            {"role": "assistant", "content": "extra tail"},
+        ]
+
+        tombstoned = c._tombstone_tool_results_for_summary(msgs)
+        tool_msg = next(m for m in tombstoned if m.get("role") == "tool")
+        assert "[tool result compacted]" in tool_msg["content"]
+        assert "tool: read_file" in tool_msg["content"]
+        assert "tool_call_id: call_1" in tool_msg["content"]
+        assert "refetchable: yes" in tool_msg["content"]
+        assert 'args: {"path": "config.py"}' in tool_msg["content"]
+
+    def test_sanitize_tool_pairs_moves_results_next_to_parent_call(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+
+        result = c._sanitize_tool_pairs([
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                }],
+            },
+            {"role": "user", "content": "intervening message"},
+            {"role": "tool", "tool_call_id": "call_1", "content": "file contents"},
+        ])
+
+        assert result[0]["role"] == "assistant"
+        assert result[1] == {"role": "tool", "tool_call_id": "call_1", "content": "file contents"}
+        assert result[2] == {"role": "user", "content": "intervening message"}
+
+    def test_recompression_does_not_feed_existing_summary_as_turn(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "updated summary"
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=2,
+                protect_last_n=2,
+            )
+        c.tail_token_budget = 10
+        c._previous_summary = "previous summary body"
+
+        merged = (
+            f"{SUMMARY_PREFIX}\nold merged summary\n\n"
+            "--- END OF CONTEXT SUMMARY — respond to the message below, "
+            "not the summary above ---\n\n"
+            "real tail content"
+        )
+        msgs = [
+            {"role": "user", "content": "start"},
+            {"role": "assistant", "content": "ack"},
+            {"role": "user", "content": f"{SUMMARY_PREFIX}\nold standalone summary"},
+            {"role": "user", "content": merged},
+            {"role": "assistant", "content": "middle work"},
+            {"role": "user", "content": "next"},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "latest ask"},
+        ]
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response) as mock_call:
+            c.compress(msgs, current_tokens=90_000)
+
+        prompt = mock_call.call_args.kwargs["messages"][0]["content"]
+        assert "previous summary body" in prompt
+        assert "old standalone summary" not in prompt
+        assert "old merged summary" not in prompt
+        assert "real tail content" in prompt
+
 
 class TestGenerateSummaryNoneContent:
     """Regression: content=None (from tool-call-only assistant messages) must not crash."""

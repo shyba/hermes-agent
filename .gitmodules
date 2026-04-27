@@ -1,3 +1,6 @@
 [submodule "tinker-atropos"]
 	path = tinker-atropos
 	url = https://github.com/nousresearch/tinker-atropos
+[submodule "vendor/context-mode"]
+	path = vendor/context-mode
+	url = https://github.com/mksglu/context-mode.git

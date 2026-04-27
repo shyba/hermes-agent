@@ -1,0 +1,18 @@
+version: "1"
+id: harness-fixture-blocked
+objective:
+  summary: "Demonstrate blocked harness finalization."
+intent:
+  latest_user_request: "Verify behavior that depends on a missing implementation."
+acceptance_matrix:
+  - id: ac1
+    criterion: "Event corruption is detected."
+    required_evidence: "events.corruption"
+constraints:
+  - "Do not write runtime state to the real repository."
+workstreams:
+  - id: events
+    owner: worker-c
+finalization_policy:
+  complete_requires:
+    - ac1

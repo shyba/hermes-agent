@@ -197,6 +197,23 @@ TOOL_USE_ENFORCEMENT_GUIDANCE = (
     "without acting are not acceptable."
 )
 
+PARALLEL_TOOL_CALL_GUIDANCE = (
+    "# Parallel tool calls\n"
+    "Hermes can execute multiple independent tool calls from one assistant message concurrently. "
+    "Use this aggressively whenever calls do not depend on each other's results.\n"
+    "- Batch independent discovery in one response: read several files, run several searches, "
+    "or query multiple independent sources at the same time.\n"
+    "- Prefer parallel calls over step-by-step serial calls for independent read_file, "
+    "search_files, web_search, web_extract, vision_analyze, skills_list, skill_view, and "
+    "session_search work.\n"
+    "- File-writing tools may be parallel only when they target different non-overlapping paths: "
+    "write_file, edit_file, and patch on separate files are acceptable.\n"
+    "- Do not parallelize calls that depend on prior output, clarify/user-interactive prompts, "
+    "or terminal commands with side effects unless you know they are independent.\n"
+    "Default behavior: if you can name two or more independent tool calls now, emit all of them "
+    "in the same assistant response."
+)
+
 # Model name substrings that trigger tool-use enforcement guidance.
 # Add new patterns here when a model family needs explicit steering.
 TOOL_USE_ENFORCEMENT_MODELS = ("gpt", "codex", "gemini", "gemma", "grok")

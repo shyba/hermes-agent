@@ -17,6 +17,7 @@ from hermes_cli.plugins import (
     PluginContext,
     PluginManager,
     PluginManifest,
+    apply_final_response_transforms,
     get_plugin_manager,
     get_plugin_command_handler,
     get_plugin_commands,
@@ -329,6 +330,7 @@ class TestPluginHooks:
         assert "post_api_request" in VALID_HOOKS
         assert "transform_terminal_output" in VALID_HOOKS
         assert "transform_tool_result" in VALID_HOOKS
+        assert "transform_final_response" in VALID_HOOKS
 
     def test_valid_hooks_include_pre_gateway_dispatch(self):
         assert "pre_gateway_dispatch" in VALID_HOOKS
@@ -534,6 +536,78 @@ class TestPreToolCallBlocking:
             ],
         )
         assert get_pre_tool_call_block_message("terminal", {}) == "first blocker"
+
+
+class TestFinalResponseTransforms:
+    """Tests for transform_final_response normalization."""
+
+    def test_string_transform_replaces_final_response(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: ["rewritten"],
+        )
+
+        result = apply_final_response_transforms(
+            final_response="original",
+            completed=True,
+            partial=False,
+            session_id="s1",
+        )
+
+        assert result == {
+            "final_response": "rewritten",
+            "completed": True,
+            "partial": False,
+        }
+
+    def test_dict_transform_updates_response_completed_and_partial(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [
+                {
+                    "final_response": "changed",
+                    "completed": False,
+                    "partial": True,
+                    "metadata": {"source": "test"},
+                }
+            ],
+        )
+
+        result = apply_final_response_transforms(
+            final_response="original",
+            completed=True,
+            partial=False,
+            task_id="t1",
+        )
+
+        assert result == {
+            "final_response": "changed",
+            "completed": False,
+            "partial": True,
+            "metadata": {"source": "test"},
+        }
+
+    def test_invalid_returns_are_ignored(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [
+                None,
+                1,
+                {"final_response": 3, "completed": "false", "partial": "true"},
+            ],
+        )
+
+        result = apply_final_response_transforms(
+            final_response="original",
+            completed=True,
+            partial=False,
+        )
+
+        assert result == {
+            "final_response": "original",
+            "completed": True,
+            "partial": False,
+        }
 
 
 # ── TestPluginContext ──────────────────────────────────────────────────────

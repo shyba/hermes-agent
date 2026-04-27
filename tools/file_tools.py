@@ -842,6 +842,19 @@ def write_file_tool(path: str, content: str, task_id: str = "default") -> str:
         return tool_error(str(e))
 
 
+def edit_file_tool(path: str, old_text: str, new_text: str,
+                   replace_all: bool = False, task_id: str = "default") -> str:
+    """Preferred targeted edit wrapper over patch replace mode."""
+    return patch_tool(
+        mode="replace",
+        path=path,
+        old_string=old_text,
+        new_string=new_text,
+        replace_all=replace_all,
+        task_id=task_id,
+    )
+
+
 def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                new_string: str = None, replace_all: bool = False, patch: str = None,
                task_id: str = "default") -> str:
@@ -1037,7 +1050,7 @@ READ_FILE_SCHEMA = {
 
 WRITE_FILE_SCHEMA = {
     "name": "write_file",
-    "description": "Write content to a file, completely replacing existing content. Use this instead of echo/cat heredoc in terminal. Creates parent directories automatically. OVERWRITES the entire file — use 'patch' for targeted edits.",
+    "description": "Create or completely replace a file. Use this instead of echo/cat heredoc in terminal. Creates parent directories automatically. OVERWRITES the entire file — use edit_file for normal targeted edits to existing files.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -1048,9 +1061,30 @@ WRITE_FILE_SCHEMA = {
     }
 }
 
+EDIT_FILE_SCHEMA = {
+    "name": "edit_file",
+    "description": (
+        "Preferred tool for modifying existing text files. Use this for normal code edits instead of "
+        "execute_code, Python open()/Path.write_text(), sed, or awk. Replaces a unique old_text block "
+        "with new_text, returns a unified diff, tracks stale/concurrent writes, and auto-runs syntax "
+        "checks when available. Read the file first and include enough surrounding context in old_text "
+        "to make the match unique."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "File path to edit"},
+            "old_text": {"type": "string", "description": "Exact text block to replace. Must be unique unless replace_all=true. Include surrounding lines for context."},
+            "new_text": {"type": "string", "description": "Replacement text. Can be an empty string to delete the matched block."},
+            "replace_all": {"type": "boolean", "description": "Replace all occurrences instead of requiring a unique match (default: false)", "default": False},
+        },
+        "required": ["path", "old_text", "new_text"],
+    },
+}
+
 PATCH_SCHEMA = {
     "name": "patch",
-    "description": "Targeted find-and-replace edits in files. Use this instead of sed/awk in terminal. Uses fuzzy matching (9 strategies) so minor whitespace/indentation differences won't break it. Returns a unified diff. Auto-runs syntax checks after editing.\n\nReplace mode (default): find a unique string and replace it.\nPatch mode: apply V4A multi-file patches for bulk changes.",
+    "description": "Advanced file patch tool. Prefer edit_file for ordinary targeted edits. Use patch mode for V4A multi-file patches or bulk changes. Uses fuzzy matching (9 strategies), returns a unified diff, and auto-runs syntax checks after editing.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -1095,6 +1129,23 @@ def _handle_write_file(args, **kw):
     return write_file_tool(path=args.get("path", ""), content=args.get("content", ""), task_id=tid)
 
 
+def _handle_edit_file(args, **kw):
+    tid = kw.get("task_id") or "default"
+    old_text = args.get("old_text")
+    if old_text is None:
+        old_text = args.get("old_string")
+    new_text = args.get("new_text")
+    if new_text is None:
+        new_text = args.get("new_string")
+    return edit_file_tool(
+        path=args.get("path", ""),
+        old_text=old_text,
+        new_text=new_text,
+        replace_all=args.get("replace_all", False),
+        task_id=tid,
+    )
+
+
 def _handle_patch(args, **kw):
     tid = kw.get("task_id") or "default"
     return patch_tool(
@@ -1116,5 +1167,6 @@ def _handle_search_files(args, **kw):
 
 registry.register(name="read_file", toolset="file", schema=READ_FILE_SCHEMA, handler=_handle_read_file, check_fn=_check_file_reqs, emoji="📖", max_result_size_chars=float('inf'))
 registry.register(name="write_file", toolset="file", schema=WRITE_FILE_SCHEMA, handler=_handle_write_file, check_fn=_check_file_reqs, emoji="✍️", max_result_size_chars=100_000)
+registry.register(name="edit_file", toolset="file", schema=EDIT_FILE_SCHEMA, handler=_handle_edit_file, check_fn=_check_file_reqs, emoji="✏️", max_result_size_chars=100_000)
 registry.register(name="patch", toolset="file", schema=PATCH_SCHEMA, handler=_handle_patch, check_fn=_check_file_reqs, emoji="🔧", max_result_size_chars=100_000)
 registry.register(name="search_files", toolset="file", schema=SEARCH_FILES_SCHEMA, handler=_handle_search_files, check_fn=_check_file_reqs, emoji="🔎", max_result_size_chars=100_000)

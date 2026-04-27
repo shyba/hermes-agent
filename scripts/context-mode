@@ -1,0 +1,355 @@
+#!/usr/bin/env bash
+# Manage the optional context-mode submodule used by the Hermes context-mode
+# integration prototype.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+SUBMODULE_PATH="${HERMES_CONTEXT_MODE_SUBMODULE_PATH:-vendor/context-mode}"
+CONTEXT_MODE_DIR="${HERMES_CONTEXT_MODE_DIR:-$ROOT_DIR/$SUBMODULE_PATH}"
+HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+
+log() {
+    printf '%s\n' "-> $*" >&2
+}
+
+warn() {
+    printf '%s\n' "warning: $*" >&2
+}
+
+die() {
+    printf '%s\n' "error: $*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<'USAGE'
+Usage: scripts/context-mode <command> [args...]
+
+Commands:
+  init         Initialize/update the vendor/context-mode submodule.
+  deps         Install context-mode Node dependencies for local development.
+  build        Install deps and build context-mode bundles.
+  install      Build, install wrapper, and configure Hermes MCP settings.
+  server       Run the vendored context-mode MCP server.
+  configure    Write mcp_servers.context-mode to ~/.hermes/config.yaml.
+  verify       Run doctor and an MCP client smoke test against the wrapper.
+  doctor      Run context-mode doctor through the vendored CLI bundle.
+  setup        Run context-mode setup through the vendored CLI bundle.
+  stats        Run context-mode stats through the vendored CLI bundle.
+  bin          Print the vendored context-mode executable command.
+  install-bin  Create ~/.hermes/bin/context-mode wrapper for this checkout.
+  help         Show this help.
+
+Environment:
+  HERMES_CONTEXT_MODE_DIR              Override the submodule directory.
+  HERMES_CONTEXT_MODE_SUBMODULE_PATH   Override the submodule path.
+  CONTEXT_MODE_PACKAGE_MANAGER         Force bun, npm, pnpm, or yarn.
+  HERMES_HOME                          Data directory for install/configure.
+USAGE
+}
+
+ensure_submodule() {
+    if [ ! -f "$ROOT_DIR/.gitmodules" ]; then
+        die ".gitmodules not found; run this from a Hermes checkout"
+    fi
+
+    if [ ! -f "$CONTEXT_MODE_DIR/package.json" ]; then
+        log "initializing $SUBMODULE_PATH"
+        git -C "$ROOT_DIR" submodule update --init --recursive "$SUBMODULE_PATH"
+    fi
+
+    if [ ! -f "$CONTEXT_MODE_DIR/package.json" ]; then
+        die "context-mode package.json not found at $CONTEXT_MODE_DIR"
+    fi
+}
+
+ensure_node_runtime() {
+    # Reuse the installer helper so fresh clones do not need separate Node
+    # setup instructions.
+    # shellcheck source=scripts/lib/node-bootstrap.sh
+    . "$ROOT_DIR/scripts/lib/node-bootstrap.sh"
+    ensure_node || die "Node.js is required for context-mode"
+
+    # The installer may expose only ~/.local/bin/node as a symlink while npm
+    # and corepack live next to the real Node binary. Add that directory so a
+    # fresh shell can build submodules without requiring nvm shell init.
+    node_bin="$(command -v node || true)"
+    if [ -n "$node_bin" ]; then
+        node_real="$(readlink -f "$node_bin" 2>/dev/null || printf '%s\n' "$node_bin")"
+        node_dir="$(cd "$(dirname "$node_real")" && pwd)"
+        case ":$PATH:" in
+            *":$node_dir:"*) ;;
+            *) export PATH="$node_dir:$PATH" ;;
+        esac
+    fi
+}
+
+package_manager() {
+    if [ -n "${CONTEXT_MODE_PACKAGE_MANAGER:-}" ]; then
+        printf '%s\n' "$CONTEXT_MODE_PACKAGE_MANAGER"
+        return
+    fi
+
+    if command -v bun >/dev/null 2>&1 && [ -f "$CONTEXT_MODE_DIR/bun.lock" ]; then
+        printf 'bun\n'
+        return
+    fi
+
+    if command -v npm >/dev/null 2>&1; then
+        printf 'npm\n'
+        return
+    fi
+
+    die "no supported package manager found (install bun or npm)"
+}
+
+run_pm() {
+    pm="$(package_manager)"
+    case "$pm" in
+        bun)
+            bun "$@"
+            ;;
+        npm)
+            if [ "${1:-}" = "install" ]; then
+                shift
+                npm install --no-audit --no-fund "$@"
+            else
+                npm "$@"
+            fi
+            ;;
+        pnpm)
+            if command -v pnpm >/dev/null 2>&1; then
+                pnpm "$@"
+            else
+                corepack pnpm "$@"
+            fi
+            ;;
+        yarn)
+            yarn "$@"
+            ;;
+        *)
+            die "unsupported package manager: $pm"
+            ;;
+    esac
+}
+
+install_deps() {
+    ensure_submodule
+    ensure_node_runtime
+    log "installing context-mode dependencies with $(package_manager)"
+    (
+        cd "$CONTEXT_MODE_DIR"
+        case "$(package_manager)" in
+            bun) run_pm install --frozen-lockfile ;;
+            npm) run_pm install ;;
+            pnpm) run_pm install ;;
+            yarn) run_pm install ;;
+        esac
+    )
+}
+
+build_context_mode() {
+    install_deps
+    log "building context-mode"
+    (
+        cd "$CONTEXT_MODE_DIR"
+        case "$(package_manager)" in
+            bun) run_pm run build ;;
+            *) run_pm run build ;;
+        esac
+    )
+}
+
+context_mode_command() {
+    ensure_submodule
+    printf 'node %q\n' "$ROOT_DIR/scripts/context-mode-server.mjs"
+}
+
+run_context_mode_server() {
+    ensure_submodule
+    ensure_node_runtime
+    exec node "$ROOT_DIR/scripts/context-mode-server.mjs" "$@"
+}
+
+run_context_mode() {
+    ensure_submodule
+    ensure_node_runtime
+    if [ -f "$CONTEXT_MODE_DIR/cli.bundle.mjs" ]; then
+        node "$CONTEXT_MODE_DIR/cli.bundle.mjs" "$@"
+        return
+    fi
+    if [ -f "$CONTEXT_MODE_DIR/build/cli.js" ]; then
+        node "$CONTEXT_MODE_DIR/build/cli.js" "$@"
+        return
+    fi
+    die "context-mode CLI bundle not found; run scripts/context-mode build"
+}
+
+install_bin() {
+    ensure_submodule
+    mkdir -p "$HERMES_HOME/bin"
+    wrapper="$HERMES_HOME/bin/context-mode"
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf 'ROOT=%q\n' "$CONTEXT_MODE_DIR"
+        printf 'LAUNCHER=%q\n' "$ROOT_DIR/scripts/context-mode-server.mjs"
+        printf 'case "${1:-}" in\n'
+        printf '  doctor|setup|upgrade|hook|insight)\n'
+        printf '    exec node "$ROOT/cli.bundle.mjs" "$@"\n'
+        printf '    ;;\n'
+        printf '  *)\n'
+        printf '    HERMES_CONTEXT_MODE_DIR="$ROOT" exec node "$LAUNCHER" "$@"\n'
+        printf '    ;;\n'
+        printf 'esac\n'
+    } > "$wrapper"
+    chmod +x "$wrapper"
+    log "installed $wrapper"
+    log "add this to PATH if needed: export PATH=\"$HERMES_HOME/bin:\$PATH\""
+}
+
+configure_hermes() {
+    ensure_submodule
+    wrapper="$HERMES_HOME/bin/context-mode"
+    if [ ! -x "$wrapper" ]; then
+        install_bin
+    fi
+
+    mkdir -p "$HERMES_HOME"
+    config_file="$HERMES_HOME/config.yaml"
+    log "configuring Hermes MCP server in $config_file"
+    python3 - "$config_file" "$wrapper" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+config_path = Path(sys.argv[1])
+command = sys.argv[2]
+block = [
+    "  context-mode:\n",
+    f"    command: {json.dumps(command)}\n",
+    "    enabled: true\n",
+]
+
+if config_path.exists():
+    lines = config_path.read_text(encoding="utf-8").splitlines(True)
+else:
+    lines = []
+
+section_re = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*\s*:")
+mcp_re = re.compile(r"^mcp_servers\s*:\s*(?:\{\}\s*)?(?:#.*)?$")
+sibling_re = re.compile(r"^  [^\s#][^:]*:")
+
+mcp_idx = next((i for i, line in enumerate(lines) if mcp_re.match(line)), None)
+
+if mcp_idx is None:
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
+    if lines and lines[-1].strip():
+        lines.append("\n")
+    lines.extend(["mcp_servers:\n", *block])
+else:
+    lines[mcp_idx] = "mcp_servers:\n"
+    start = mcp_idx + 1
+    end = start
+    while end < len(lines):
+        line = lines[end]
+        if line.strip() and section_re.match(line):
+            break
+        end += 1
+
+    section = lines[start:end]
+    cleaned = []
+    i = 0
+    while i < len(section):
+        if re.match(r"^  context-mode\s*:", section[i]):
+            i += 1
+            while i < len(section):
+                line = section[i]
+                if sibling_re.match(line):
+                    break
+                if line.strip() and not line.startswith(("    ", "  #")):
+                    break
+                i += 1
+            continue
+        cleaned.append(section[i])
+        i += 1
+
+    lines = lines[:start] + block + cleaned + lines[end:]
+
+config_path.write_text("".join(lines), encoding="utf-8")
+PY
+    log "configured mcp_servers.context-mode -> $wrapper"
+}
+
+install_context_mode() {
+    build_context_mode
+    install_bin
+    configure_hermes
+}
+
+verify_context_mode() {
+    ensure_submodule
+    ensure_node_runtime
+    wrapper="$HERMES_HOME/bin/context-mode"
+    if [ ! -x "$wrapper" ]; then
+        die "$wrapper is not installed; run scripts/context-mode install"
+    fi
+
+    log "running context-mode doctor"
+    PATH="$HERMES_HOME/bin:$PATH" "$wrapper" doctor
+
+    log "running context-mode MCP smoke test"
+    PATH="$HERMES_HOME/bin:$PATH" node \
+        "$ROOT_DIR/scripts/context-mode-smoke.mjs" \
+        "$wrapper" "$CONTEXT_MODE_DIR" "$ROOT_DIR"
+}
+
+cmd="${1:-help}"
+if [ "$#" -gt 0 ]; then
+    shift
+fi
+
+case "$cmd" in
+    init)
+        ensure_submodule
+        log "context-mode submodule is ready at $CONTEXT_MODE_DIR"
+        ;;
+    deps)
+        install_deps
+        ;;
+    build)
+        build_context_mode
+        ;;
+    install)
+        install_context_mode
+        ;;
+    server)
+        run_context_mode_server "$@"
+        ;;
+    configure)
+        configure_hermes
+        ;;
+    verify|test)
+        verify_context_mode
+        ;;
+    doctor|setup|stats)
+        run_context_mode "$cmd" "$@"
+        ;;
+    bin)
+        context_mode_command
+        ;;
+    install-bin)
+        install_bin
+        ;;
+    help|-h|--help)
+        usage
+        ;;
+    *)
+        usage
+        die "unknown command: $cmd"
+        ;;
+esac

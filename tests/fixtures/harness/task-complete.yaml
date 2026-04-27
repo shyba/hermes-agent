@@ -1,0 +1,22 @@
+version: "1"
+id: harness-fixture-complete
+objective:
+  summary: "Add focused harness tests and fixtures."
+intent:
+  latest_user_request: "Implement first-slice harness tests."
+acceptance_matrix:
+  - id: ac1
+    criterion: "Plugin registers /harness."
+    required_evidence: "tests.focused"
+  - id: ac2
+    criterion: "Harness events are ordered."
+    required_evidence: "tests.focused"
+constraints:
+  - "Only test and fixture paths may be edited."
+workstreams:
+  - id: tests
+    owner: worker-c
+finalization_policy:
+  complete_requires:
+    - ac1
+    - ac2

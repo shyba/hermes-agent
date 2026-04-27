@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Convenience wrapper for fresh clones and CI jobs that want the optional
+# context-mode submodule built from source.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec "$SCRIPT_DIR/context-mode" build "$@"

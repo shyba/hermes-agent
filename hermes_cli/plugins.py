@@ -62,6 +62,11 @@ VALID_HOOKS: Set[str] = {
     "post_tool_call",
     "transform_terminal_output",
     "transform_tool_result",
+    # Final response transform hook. Fired after the agent has built the
+    # turn result fields and before run_conversation() returns. Plugins may
+    # return a string replacement or a dict overriding final_response,
+    # completed, partial, pending_steer, and/or metadata.
+    "transform_final_response",
     "pre_llm_call",
     "post_llm_call",
     "pre_api_request",
@@ -1079,6 +1084,74 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     Returns a list of non-``None`` return values from plugin callbacks.
     """
     return get_plugin_manager().invoke_hook(hook_name, **kwargs)
+
+
+def apply_final_response_transforms(
+    *,
+    final_response: Any,
+    completed: bool,
+    partial: bool,
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    """Apply the first valid ``transform_final_response`` hook result.
+
+    Valid hook returns are:
+    - ``str``: replacement ``final_response``
+    - ``dict``: may override ``final_response``, ``completed``, ``partial``,
+      ``pending_steer``, and ``metadata`` when present with the expected type.
+
+    Invalid returns are ignored. Hook invocation itself is fail-open through
+    ``invoke_hook``; this helper is also defensive so final result construction
+    is never blocked by plugin mistakes.
+    """
+    transformed: Dict[str, Any] = {
+        "final_response": final_response,
+        "completed": completed,
+        "partial": partial,
+    }
+
+    try:
+        hook_results = invoke_hook(
+            "transform_final_response",
+            final_response=final_response,
+            completed=completed,
+            partial=partial,
+            **kwargs,
+        )
+    except Exception as exc:
+        logger.warning("transform_final_response hook invocation failed: %s", exc)
+        return transformed
+
+    for hook_result in hook_results:
+        if isinstance(hook_result, str):
+            transformed["final_response"] = hook_result
+            return transformed
+
+        if not isinstance(hook_result, dict):
+            continue
+
+        updated = False
+        if "final_response" in hook_result and isinstance(hook_result["final_response"], str):
+            transformed["final_response"] = hook_result["final_response"]
+            updated = True
+        if "completed" in hook_result and isinstance(hook_result["completed"], bool):
+            transformed["completed"] = hook_result["completed"]
+            updated = True
+        if "partial" in hook_result and isinstance(hook_result["partial"], bool):
+            transformed["partial"] = hook_result["partial"]
+            updated = True
+        if "metadata" in hook_result and isinstance(hook_result["metadata"], dict):
+            transformed["metadata"] = hook_result["metadata"]
+            updated = True
+        pending_steer = hook_result.get("pending_steer")
+        if isinstance(pending_steer, str) and pending_steer.strip():
+            transformed["pending_steer"] = pending_steer.strip()
+            updated = True
+
+        if updated:
+            return transformed
+
+    return transformed
 
 
 

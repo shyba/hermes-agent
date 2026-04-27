@@ -795,7 +795,7 @@ TERMINAL_TOOL_DESCRIPTION = """Execute shell commands on a Linux environment. Fi
 Do NOT use cat/head/tail to read files — use read_file instead.
 Do NOT use grep/rg/find to search — use search_files instead.
 Do NOT use ls to list directories — use search_files(target='files') instead.
-Do NOT use sed/awk to edit files — use patch instead.
+Do NOT use sed/awk to edit files — use edit_file instead.
 Do NOT use echo/cat heredoc to create files — use write_file instead.
 Reserve terminal for: builds, installs, git, processes, scripts, network, package managers, and anything that needs a shell.
 
